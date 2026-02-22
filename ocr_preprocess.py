@@ -224,37 +224,83 @@ def preprocess_for_ocr(pil_image, preset="auto", upscale_factor=2, verbose=False
 def postprocess_khmer(text):
     """
     Fix common Tesseract OCR errors specific to Khmer text.
-    These patterns are derived from analyzing actual OCR output errors.
+    General-purpose corrections that work for any Khmer PDF document.
     """
-    # Common character misreadings in Khmer
-    corrections = [
-        # Bullet points: '9' is often misread instead of '•' or '០'
-        (r'^9\s', '• '),           # Line-starting 9 → bullet
-        (r'\n9\s', '\n• '),        # After newline
+    
+    # ---- STEP 1: Line-level cleanup (remove garbage lines) ----
+    cleaned_lines = []
+    for line in text.split('\n'):
+        stripped = line.strip()
         
-        # Common Khmer character confusions
-        ('ក្នង', 'ក្នុង'),           # Missing vowel 'ុ'
-        ('ព្រមទាង', 'ព្រមទាំង'),     # Missing 'ំ'
-        ('ក្លូយៗ', 'កូនៗ'),         # Misread word
-        ('គួអង្គ', 'តួអង្គ'),        # គួ → តួ
-        ('គ្រួបង្រៀន', 'គ្រូបង្រៀន'),  # គ្រួ → គ្រូ
-        ('រំពុក', 'រំឭក'),           # Misread
-        ('រំពូក', 'រំឭក'),           # Misread variant  
-        ('ស្តែង', 'ស្ដែង'),          # Character variant
-        ('ដំណេរ', 'ដំណើរ'),         # Missing vowel
+        # Remove standalone page numbers (single digit on its own line)
+        if re.match(r'^\d{1,2}$', stripped):
+            continue
+        
+        # Remove very short garbage lines (1-2 random characters, not Khmer numbers)
+        if len(stripped) <= 2 and not re.match(r'^[\u1780-\u17FF]', stripped) and stripped not in ('', '•'):
+            continue
+        
+        # Remove lines that are only English garbage (no Khmer at all, not meaningful)
+        if stripped and not re.search(r'[\u1780-\u17FF]', stripped):
+            # Keep lines with known useful content (page markers, known English names)
+            known_english = ['ChatGPT', 'Gemini', 'Claude', 'Copilot', 'JOTA', 'EdTech', 'AI', 'Al']
+            if not any(eng in stripped for eng in known_english) and len(stripped) < 40:
+                if not stripped.startswith('---'):  # Keep page separators
+                    continue
+        
+        cleaned_lines.append(line)
+    
+    result = '\n'.join(cleaned_lines)
+    
+    # ---- STEP 2: Khmer character corrections ----
+    corrections = [
+        # Bullet points: '9' is often misread instead of '•'
+        (r'^9\s', '• '),
+        (r'\n9\s', '\n• '),
+        
+        # Common missing vowels
+        ('ក្នង', 'ក្នុង'),           # Missing ុ
+        ('ព្រមទាង', 'ព្រមទាំង'),     # Missing ំ
+        ('ដំណេរ', 'ដំណើរ'),         # Missing ើ
         ('ស័ក្សា', 'សិក្សា'),         # Vowel confusion
+        ('កម្ពជា', 'កម្ពុជា'),        # Missing ុ
+        ('ឥំរិយាបថ', 'ឥរិយាបថ'),    # Extra ំ
+        
+        # Common character confusions
+        ('គួអង្គ', 'តួអង្គ'),         # គួ → តួ
+        ('គ្រួបង្រៀន', 'គ្រូបង្រៀន'),   # គ្រួ → គ្រូ
+        ('រំពុក', 'រំឭក'),            # Misread
+        ('រំពូក', 'រំឭក'),            # Misread variant
+        ('ឌីជីប៉ល', 'ឌីជីថល'),       # ប៉ → ថ
+        ('ទិសេដា', 'ទិសដៅ'),         # Misread
+        
+        # Common word-level fixes
+        ('ក្លូយៗ', 'កូនៗ'),          # Misread word
+        ('បំណេះ', 'បំណិន'),          # Common confusion (may vary)
+        
+        # Section header fixes
+        ('៖ស', 'សេ'),               # ៖ If prefix on សេចក្តី
     ]
     
-    result = text
     for pattern, replacement in corrections:
-        if pattern.startswith('^') or pattern.startswith('\n'):
+        if pattern.startswith('^') or pattern.startswith('\\n'):
             result = re.sub(pattern, replacement, result, flags=re.MULTILINE)
         else:
             result = result.replace(pattern, replacement)
     
-    # Clean up common artifacts
-    result = re.sub(r'\|', '', result)          # Stray pipe characters
-    result = re.sub(r'\s{3,}', '  ', result)    # Compress excessive whitespace
+    # ---- STEP 3: Symbol cleanup ----
+    result = re.sub(r'\|', '', result)           # Stray pipe characters
+    result = re.sub(r'^- =\s', '-  ', result, flags=re.MULTILINE)  # "- =" → "-"
+    result = re.sub(r'\s/\s', ' ', result)       # Stray " / " separators
+    result = re.sub(r'\s{3,}', '  ', result)     # Compress excessive whitespace
+    result = re.sub(r'^\]\s*$', '', result, flags=re.MULTILINE)  # Stray brackets
+    
+    # ---- STEP 4: Fix broken words (space in middle) ----
+    result = re.sub(r'បា\s+ន', 'បាន', result)    # ដែលបា ន → ដែលបាន
+    result = re.sub(r'រួ\s+ម', 'រួម', result)      # រួ ម → រួម
+    
+    # Remove empty lines left by cleanup (keep max 2 consecutive)
+    result = re.sub(r'\n{4,}', '\n\n\n', result)
     
     return result
 
