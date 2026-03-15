@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="km">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Khmer OCR — អក្សរខ្មែរ Text Extractor</title>
+    <meta name="description" content="Extract Khmer text from PDF documents using smart OCR preprocessing and AI correction.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+Khmer:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Animated background -->
+    <div class="bg-gradient"></div>
+    <div class="bg-noise"></div>
+
+    <!-- Header -->
+    <header class="header">
+        <div class="header-content">
+            <a href="/" class="logo" style="text-decoration: none; color: inherit; cursor: pointer;">
+                <div class="logo-icon">ក</div>
+                <div>
+                    <h1>Khmer OCR</h1>
+                    <p class="subtitle">អក្សរខ្មែរ Text Extractor</p>
+                </div>
+            </a>
+            <div class="header-badge">
+                <span class="badge-dot"></span>
+                Smart Preprocessing Pipeline
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <!-- Upload Section -->
+        <section id="upload-section" class="section">
+            <div class="section-header">
+                <h2>📄 Upload Document</h2>
+                <p>Drag & drop a PDF or choose from existing documents</p>
+            </div>
+
+            <div class="upload-grid">
+                <!-- Drag & Drop Zone -->
+                <div class="upload-zone" id="drop-zone">
+                    <div class="upload-zone-content">
+                        <div class="upload-icon">
+                            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                                <path d="M24 4L24 32M24 4L16 12M24 4L32 12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M8 28V38C8 40.2091 9.79086 42 12 42H36C38.2091 42 40 40.2091 40 38V28" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                            </svg>
+                        </div>
+                        <p class="upload-text">Drop your PDF here</p>
+                        <p class="upload-hint">or click to browse • Max 20MB</p>
+                    </div>
+                    <input type="file" id="file-input" accept=".pdf" hidden>
+                </div>
+
+                <!-- Quick Select from existing docs -->
+                <div class="quick-select glass-card">
+                    <h3>📁 Your Documents</h3>
+                    <div id="doc-list" class="doc-list">
+                        <div class="loading-dots">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- File Preview (shown after upload) -->
+            <div id="file-preview" class="file-preview glass-card" style="display:none;">
+                <div class="file-info">
+                    <div class="file-icon-large">📄</div>
+                    <div>
+                        <h3 id="preview-filename">—</h3>
+                        <p id="preview-size" class="text-muted">—</p>
+                    </div>
+                </div>
+                <button id="btn-remove" class="btn btn-ghost" title="Remove file">✕</button>
+            </div>
+        </section>
+
+        <!-- Settings Section -->
+        <section id="settings-section" class="section" style="display:none;">
+            <div class="section-header">
+                <h2>⚙️ Processing Settings</h2>
+                <p>Configure the OCR pipeline</p>
+            </div>
+
+            <div class="settings-grid">
+                <div class="setting-group glass-card">
+                    <label class="setting-label">Preprocessing Mode</label>
+                    <div class="preset-options" id="preset-options">
+                        <button class="preset-btn active" data-preset="auto">
+                            <span class="preset-icon">🔮</span>
+                            <span class="preset-name">Auto</span>
+                            <span class="preset-desc">Smart detection</span>
+                        </button>
+                        <button class="preset-btn" data-preset="clean">
+                            <span class="preset-icon">✨</span>
+                            <span class="preset-name">Clean</span>
+                            <span class="preset-desc">Digital PDFs</span>
+                        </button>
+                        <button class="preset-btn" data-preset="scan">
+                            <span class="preset-icon">📠</span>
+                            <span class="preset-name">Scan</span>
+                            <span class="preset-desc">Scanned docs</span>
+                        </button>
+                        <button class="preset-btn" data-preset="photo">
+                            <span class="preset-icon">📷</span>
+                            <span class="preset-name">Photo</span>
+                            <span class="preset-desc">Camera shots</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="setting-group glass-card">
+                    <label class="setting-label">DPI Resolution</label>
+                    <div class="dpi-slider">
+                        <input type="range" id="dpi-range" min="150" max="600" step="50" value="300">
+                        <span id="dpi-value" class="dpi-value">300</span>
+                    </div>
+                    <p class="setting-hint">Higher DPI = Better quality but slower</p>
+                </div>
+
+                <div class="setting-group glass-card">
+                    <label class="setting-label">AI Correction</label>
+                    <div class="toggle-wrap">
+                        <label class="toggle">
+                            <input type="checkbox" id="ai-toggle">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="toggle-label">
+                            <strong>Google Gemini AI</strong>
+                            <span class="text-muted">Fix complex errors with AI</span>
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+            <button id="btn-process" class="btn btn-primary btn-large">
+                <span class="btn-icon">🚀</span>
+                Start Processing
+            </button>
+        </section>
+
+        <!-- Progress Section -->
+        <section id="progress-section" class="section" style="display:none;">
+            <div class="section-header">
+                <h2>⏳ Processing</h2>
+                <p id="progress-subtitle">Extracting Khmer text from your document...</p>
+            </div>
+
+            <div class="progress-container glass-card">
+                <div class="progress-bar-wrap">
+                    <div class="progress-bar" id="progress-bar" style="width: 0%"></div>
+                </div>
+                <div class="progress-percent" id="progress-percent">0%</div>
+                <div class="progress-log" id="progress-log"></div>
+            </div>
+        </section>
+
+        <!-- Results Section -->
+        <section id="results-section" class="section" style="display:none;">
+            <div class="section-header">
+                <h2>📝 Extracted Text</h2>
+                <p id="results-subtitle">—</p>
+            </div>
+
+            <!-- Stats Bar -->
+            <div class="stats-bar">
+                <div class="stat-card glass-card">
+                    <span class="stat-value" id="stat-pages">0</span>
+                    <span class="stat-label">Pages</span>
+                </div>
+                <div class="stat-card glass-card">
+                    <span class="stat-value" id="stat-chars">0</span>
+                    <span class="stat-label">Characters</span>
+                </div>
+                <div class="stat-card glass-card">
+                    <span class="stat-value" id="stat-quality">—</span>
+                    <span class="stat-label">Doc Type</span>
+                </div>
+                <div class="stat-card glass-card">
+                    <span class="stat-value" id="stat-fixed">0</span>
+                    <span class="stat-label">Lines Fixed</span>
+                </div>
+            </div>
+
+            <!-- Text Output -->
+            <div class="result-card glass-card">
+                <div class="result-toolbar">
+                    <div class="tab-group" id="tab-group">
+                        <button class="tab active" data-tab="corrected">Corrected</button>
+                        <button class="tab" data-tab="raw">Raw OCR</button>
+                    </div>
+                    <div class="result-actions">
+                        <button id="btn-copy" class="btn btn-ghost btn-sm" title="Copy to clipboard">
+                            📋 Copy
+                        </button>
+                        <button id="btn-download" class="btn btn-accent btn-sm" title="Download as text file">
+                            ⬇️ Download .txt
+                        </button>
+                    </div>
+                </div>
+                <div class="text-output-wrap">
+                    <pre class="text-output khmer-text" id="text-output">—</pre>
+                </div>
+            </div>
+
+            <!-- Page Details (collapsible) -->
+            <details class="page-details glass-card">
+                <summary>📊 Per-Page Quality Details</summary>
+                <div id="page-details-content" class="page-details-grid"></div>
+            </details>
+
+            <!-- New Document Button -->
+            <button id="btn-new" class="btn btn-primary btn-large" style="margin-top:1.5rem;">
+                📄 Process Another Document
+            </button>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <p>Khmer OCR • Smart Preprocessing Pipeline • Phase 1 + 2 + 3</p>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

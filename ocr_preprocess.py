@@ -232,6 +232,10 @@ def postprocess_khmer(text):
     for line in text.split('\n'):
         stripped = line.strip()
         
+        # Remove empty lines
+        if not stripped:
+            continue
+            
         # Remove standalone page numbers (single digit on its own line)
         if re.match(r'^\d{1,2}$', stripped):
             continue
@@ -239,13 +243,26 @@ def postprocess_khmer(text):
         # Remove very short garbage lines (1-2 random characters, not Khmer numbers)
         if len(stripped) <= 2 and not re.match(r'^[\u1780-\u17FF]', stripped) and stripped not in ('', '•'):
             continue
+            
+        # Count Khmer characters vs Total characters
+        khmer_chars = len(re.findall(r'[\u1780-\u17FF]', stripped))
+        total_chars = len(stripped)
         
-        # Remove lines that are only English garbage (no Khmer at all, not meaningful)
-        if stripped and not re.search(r'[\u1780-\u17FF]', stripped):
-            # Keep lines with known useful content (page markers, known English names)
-            known_english = ['ChatGPT', 'Gemini', 'Claude', 'Copilot', 'JOTA', 'EdTech', 'AI', 'Al']
-            if not any(eng in stripped for eng in known_english) and len(stripped) < 40:
-                if not stripped.startswith('---'):  # Keep page separators
+        # Remove lines that are mostly English garbage or symbols (common with graphs/noise)
+        if total_chars > 0:
+            khmer_ratio = khmer_chars / total_chars
+            
+            # If line is longer than 5 chars and has less than 15% Khmer chars, it's likely noise
+            if total_chars > 5 and khmer_ratio < 0.15:
+                # Keep lines with known useful content (page markers, known English names)
+                known_english = ['MSME', 'ChatGPT', 'Gemini', 'Claude', 'Copilot', 'JOTA', 'EdTech', 'AI', 'Al', 'IFC', 'NBC', 'CMA']
+                if not any(eng in stripped for eng in known_english) and not stripped.startswith('--- Page'):
+                    continue
+            
+            # If line has NO Khmer characters at all
+            elif khmer_chars == 0:
+                known_english = ['MSME', 'ChatGPT', 'Gemini', 'Claude', 'Copilot', 'JOTA', 'EdTech', 'AI', 'Al', 'IFC', 'NBC', 'CMA']
+                if not any(eng in stripped for eng in known_english) and not stripped.startswith('--- Page') and not re.match(r'^[0-9\s\.\,\-\%]+$', stripped):
                     continue
         
         cleaned_lines.append(line)
@@ -343,7 +360,7 @@ def read_pdf_improved(filename, dpi=300, preset="auto", apply_postprocess=True, 
     if verbose:
         print(f"   Found {len(images)} pages")
     
-    config = '--oem 3 --psm 6 -c preserve_interword_spaces=1'
+    config = '--oem 3 --psm 3 -c preserve_interword_spaces=1'
     extracted_text = ""
     
     for i, img in enumerate(images):
@@ -386,4 +403,106 @@ def preprocess_old(pil_image):
 
 def get_best_tesseract_config():
     """Returns recommended Tesseract config for Khmer documents."""
-    return '--oem 3 --psm 6 -c preserve_interword_spaces=1'
+    return '--oem 3 --psm 3 -c preserve_interword_spaces=1'
+
+
+# ============================================================
+# PHASE 3: AI TEXT CORRECTION (Google Gemini)
+# ============================================================
+def correct_with_ai(text, api_key=None, model="gemini-2.0-flash"):
+    """
+    Use Google Gemini AI to fix OCR errors in Khmer text.
+    
+    The AI understands Khmer language context and can fix errors
+    that pattern-based post-processing cannot handle.
+    
+    Args:
+        text: OCR text to correct
+        api_key: Google API key (or set GOOGLE_API_KEY env variable)
+        model: Gemini model to use
+    
+    Returns:
+        str: Corrected text
+    """
+    import os
+    from google import genai
+    
+    # Load API key from .env file (no extra dependency needed)
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+    
+    key = api_key or os.environ.get('GOOGLE_API_KEY')
+    if not key:
+        print("❌ No API key! Set GOOGLE_API_KEY environment variable or pass api_key parameter.")
+        print("   Example: export GOOGLE_API_KEY='your-key-here'")
+        return text
+    
+    # Create client
+    client = genai.Client(api_key=key)
+    
+    prompt = f"""You are a Khmer OCR error correction expert. 
+The following text was extracted from a PDF using Tesseract OCR. 
+It contains errors specific to Khmer script OCR.
+
+RULES:
+1. Fix ONLY clear OCR errors — do NOT rewrite or paraphrase
+2. Remove garbage text (random English words mixed into Khmer lines like "Shavidiunus", "givows-womo", "iy", "Sd.")
+3. Fix broken Khmer characters and missing vowels
+4. Keep the original structure, line breaks, and formatting
+5. Keep page separators like "--- Page X ---"
+6. Keep legitimate English words (ChatGPT, Gemini, AI, JOTA-JOTI, EdTech, etc.)
+7. Return ONLY the corrected text, no explanations
+
+TEXT TO CORRECT:
+{text}"""
+    
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt
+        )
+        return response.text
+    except Exception as e:
+        print(f"⚠️ AI correction failed: {e}")
+        print("   Returning text with only post-processing corrections.")
+        return text
+
+
+def read_pdf_with_ai(filename, api_key=None, dpi=300, preset="auto", verbose=True):
+    """
+    Full pipeline: PDF → Preprocessing → OCR → Post-Processing → AI Correction.
+    
+    This is the best quality extraction, combining all 3 phases.
+    
+    Args:
+        filename: Path to PDF file
+        api_key: Google API key (or set GOOGLE_API_KEY env variable)
+        dpi: Resolution (300 recommended)
+        preset: 'auto', 'clean', 'scan', or 'photo'
+        verbose: Print progress
+    
+    Returns:
+        str: AI-corrected extracted text
+    """
+    # Phase 1 + 2: Preprocessing + OCR + Post-processing
+    if verbose:
+        print("📋 Phase 1-2: Preprocessing + OCR + Post-processing")
+    text = read_pdf_improved(filename, dpi=dpi, preset=preset, 
+                              apply_postprocess=True, verbose=verbose)
+    
+    # Phase 3: AI Correction
+    if verbose:
+        print("\n🤖 Phase 3: AI Correction (Google Gemini)...")
+    
+    corrected = correct_with_ai(text, api_key=api_key)
+    
+    if verbose:
+        print("✅ AI correction complete!")
+    
+    return corrected

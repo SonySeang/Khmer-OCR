@@ -1,0 +1,7 @@
+flask>=3.0
+pytesseract
+pdf2image
+opencv-python
+Pillow
+numpy
+google-genai

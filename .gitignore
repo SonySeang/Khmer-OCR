@@ -17,5 +17,8 @@ ocr_error_report*.csv
 # OS
 .DS_Store
 
+# Uploads (web UI user uploads)
+uploads/
+
 # Conda/Env
 .env
