@@ -1,0 +1,2 @@
+This is a sample abstraet from a docunent to test 0CR.
+It contains multiple lines and sone typical words.
