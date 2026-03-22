@@ -150,6 +150,56 @@ def morphological_cleanup(binary):
     return cleaned
 
 
+def crop_to_main_text_body(binary_img):
+    """
+    Document Layout Analysis: Finds the main text contours and crops out 
+    headers, footers, and page numbers at the extreme edges.
+    """
+    h, w = binary_img.shape
+    
+    # 1. Dilate to connect text characters into blocks
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 20))
+    dilated = cv2.dilate(binary_img, kernel, iterations=2)
+    
+    # 2. Find contours
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return binary_img
+        
+    valid_bboxes = []
+    for c in contours:
+        x, y, cw, ch = cv2.boundingRect(c)
+        area = cw * ch
+        
+        # Filter out very small noise blocks
+        if area < 500:
+            continue
+            
+        # Filter out header (top 8%) and footer (bottom 8%) small blocks
+        # Only keep them if they are very large (like a massive logo/title)
+        center_y = y + (ch / 2)
+        if center_y < h * 0.08 and area < (w * h * 0.05):
+            continue  # Likely a header or top page number
+        if center_y > h * 0.92 and area < (w * h * 0.05):
+            continue  # Likely a footer or bottom page number
+            
+        valid_bboxes.append((x, y, x + cw, y + ch))
+        
+    if not valid_bboxes:
+        return binary_img
+        
+    # 3. Find global bounding box of all valid text
+    min_x = max(0, min([b[0] for b in valid_bboxes]) - 20)
+    min_y = max(0, min([b[1] for b in valid_bboxes]) - 20)
+    max_x = min(w, max([b[2] for b in valid_bboxes]) + 20)
+    max_y = min(h, max([b[3] for b in valid_bboxes]) + 20)
+    
+    # Crop the binary image
+    cropped = binary_img[int(min_y):int(max_y), int(min_x):int(max_x)]
+    return cropped
+
+
 # ============================================================
 # SMART PIPELINE: Auto-selects best processing for each image
 # ============================================================
@@ -214,6 +264,10 @@ def preprocess_for_ocr(pil_image, preset="auto", upscale_factor=2, verbose=False
     else:
         # Fallback
         binary = binarize(gray, method="adaptive")
+        
+    # Final step: Crop to main text body to remove headers/footers
+    if verbose: print("   ↳ Layout Analysis: cropping edge noise...")
+    binary = crop_to_main_text_body(binary)
     
     return Image.fromarray(binary)
 
@@ -269,6 +323,12 @@ def postprocess_khmer(text):
     
     result = '\n'.join(cleaned_lines)
     
+    # ---- STEP 1.5: Remove specific English garbage strings from mixed lines ----
+    # (Often caused by Tesseract misreading logos or sidebar OSD text)
+    result = re.sub(r'ANEANitniimia\s*', '', result)
+    result = re.sub(r'1 IN Sits inns', '', result)
+    result = re.sub(r'1 ដូចនេះ', 'ដូចនេះ', result)
+    
     # ---- STEP 2: Khmer character corrections ----
     corrections = [
         # Bullet points: '9' is often misread instead of '•'
@@ -290,6 +350,35 @@ def postprocess_khmer(text):
         ('រំពូក', 'រំឭក'),            # Misread variant
         ('ឌីជីប៉ល', 'ឌីជីថល'),       # ប៉ → ថ
         ('ទិសេដា', 'ទិសដៅ'),         # Misread
+        
+        # New dictionary additions
+        ('ហិរញ្ជវិត្ថុ', 'ហិរញ្ញវត្ថុ'),
+        ('ហិរញ្ជវត្ថុ', 'ហិរញ្ញវត្ថុ'),
+        ('អាជ្ញាបីណ្ណ', 'អាជ្ញាប័ណ្ណ'),
+        ('នេ៖', 'នេះ'),
+        ('ព្រោនថា', 'ព្រោះថា'),
+        
+        # Capital Market / Finance corrections
+        ('ទីផុរារ', 'ទីផ្សារ'),
+        ('ទិផុារ', 'ទីផ្សារ'),
+        ('ទីិផ្យវារ', 'ទីផ្សារ'),
+        ('ទិីផ្សារ', 'ទីផ្សារ'),
+        ('ជុញដូរ', 'ជួញដូរ'),
+        ('មធុម', 'មធ្យម'),
+        ('ដើមទន', 'ដើមទុន'),
+        ('កម៉ី', 'កម្ចី'),
+        ('ទៅត។', 'ទៅទៀត។'),
+        ('ដំសំខាន់', 'ដ៏សំខាន់'),
+        ('ដំមាន', 'ដ៏មាន'),
+        ('គ្រប ដណ្ឌប់', 'គ្របដណ្តប់'),
+        ('ប្រមូលផ្តំ', 'ប្រមូលផ្តុំ'),
+        
+        ('សនុស្រេប', 'សន្សំ'),
+        ('គ្រប ដ\nណ្ឌប់', 'គ្របដណ្តប់'),
+        ('ការព\nន្លឿន', 'ការពន្លឿន'),
+        ('ទីផ្សារ មូលធន', 'ទីផ្សារមូលធន'),
+        ('វែងភាគ ច្រើន', 'វែងភាគច្រើន'),
+        ('ទំនិញ', 'ហិរញ្ញវត្ថុ'), # Often confused in context of services
         
         # Common word-level fixes
         ('ក្លូយៗ', 'កូនៗ'),          # Misread word
@@ -346,9 +435,15 @@ def read_pdf_improved(filename, dpi=300, preset="auto", apply_postprocess=True, 
     import os
     
     # Set Tesseract path
+    # Set Tesseract path
     try:
-        conda_prefix = os.environ.get('CONDA_PREFIX')
-        pytesseract.pytesseract.tesseract_cmd = f"{conda_prefix}/bin/tesseract"
+        homebrew_path = '/opt/homebrew/bin/tesseract'
+        if os.path.exists(homebrew_path):
+            pytesseract.pytesseract.tesseract_cmd = homebrew_path
+        else:
+            conda_prefix = os.environ.get('CONDA_PREFIX')
+            if conda_prefix:
+                pytesseract.pytesseract.tesseract_cmd = f"{conda_prefix}/bin/tesseract"
     except:
         pass
     
@@ -360,7 +455,7 @@ def read_pdf_improved(filename, dpi=300, preset="auto", apply_postprocess=True, 
     if verbose:
         print(f"   Found {len(images)} pages")
     
-    config = '--oem 3 --psm 3 -c preserve_interword_spaces=1'
+    config = '--oem 3 --psm 1 -c preserve_interword_spaces=1'
     extracted_text = ""
     
     for i, img in enumerate(images):

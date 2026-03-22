@@ -113,7 +113,7 @@ def process_file():
             'total_pages': total_pages
         })
 
-        config = '--oem 3 --psm 3 -c preserve_interword_spaces=1'
+        config = '--oem 3 --psm 1 -c preserve_interword_spaces=1'
         pages_data = []
 
         # Step 2: Process each page
@@ -153,6 +153,13 @@ def process_file():
             except Exception as e:
                 print(f"⚠️ Failed to save debug image: {e}")
 
+            # [CUSTOM MODEL TOGGLE] 
+            # To switch to your newly trained model (once you train it on 5,000+ lines), 
+            # uncomment these next two lines and comment out the default raw_text line below!
+            
+            # custom_config = r'--tessdata-dir "tesstrain/usr/share/tessdata" --oem 3 --psm 1 -c preserve_interword_spaces=1'
+            # raw_text = pytesseract.image_to_string(processed, lang='khm_custom+eng', config=custom_config)
+            
             raw_text = pytesseract.image_to_string(processed, lang='khm+eng', config=config)
 
             # 2d: Post-processing
