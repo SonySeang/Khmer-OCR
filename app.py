@@ -113,7 +113,7 @@ def process_file():
             'total_pages': total_pages
         })
 
-        config = '--oem 3 --psm 1 -c preserve_interword_spaces=1'
+        config = '--oem 3 --psm 6 -c preserve_interword_spaces=1'
         pages_data = []
 
         # Step 2: Process each page
