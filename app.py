@@ -7,6 +7,7 @@ from flask import (
     send_file, Response, stream_with_context
 )
 from werkzeug.utils import secure_filename
+from flask_cors import CORS
 
 # Import the existing OCR pipeline
 from ocr_preprocess import (
@@ -15,6 +16,7 @@ from ocr_preprocess import (
 )
 
 app = Flask(__name__)
+CORS(app, origins=["http://localhost:5173", "http://localhost:5001"])
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  # 20MB max
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), 'uploads')
 
@@ -69,7 +71,6 @@ def process_file():
     data = request.json
     file_id = data.get('file_id')
     preset = data.get('preset', 'auto')
-    dpi = int(data.get('dpi', 300))
     use_ai = data.get('use_ai', False)
 
     # Find the uploaded file
@@ -85,23 +86,18 @@ def process_file():
         import pytesseract
         from pdf2image import convert_from_path
 
-        # Set Tesseract path (try Homebrew first, then Conda, then system default)
-        try:
-            homebrew_path = '/opt/homebrew/bin/tesseract'
-            if os.path.exists(homebrew_path):
-                pytesseract.pytesseract.tesseract_cmd = homebrew_path
-            else:
-                conda_prefix = os.environ.get('CONDA_PREFIX')
-                if conda_prefix:
-                    pytesseract.pytesseract.tesseract_cmd = f"{conda_prefix}/bin/tesseract"
-        except Exception:
-            pass
+        # Set Tesseract path
+        tesseract_path = '/opt/homebrew/bin/tesseract'
+        if os.path.exists(tesseract_path):
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+        config = '--oem 3 --psm 6 -c preserve_interword_spaces=1 -c textord_min_linesize=1.5'
 
         # Step 1: Convert PDF to images
         yield _sse({'step': 'converting', 'message': '📄 Converting PDF to images...'})
 
         try:
-            images = convert_from_path(filepath, dpi=dpi)
+            images = convert_from_path(filepath, dpi=300)
         except Exception as e:
             yield _sse({'step': 'error', 'message': f'❌ Failed to convert PDF: {str(e)}'})
             return
@@ -113,7 +109,6 @@ def process_file():
             'total_pages': total_pages
         })
 
-        config = '--oem 3 --psm 6 -c preserve_interword_spaces=1'
         pages_data = []
 
         # Step 2: Process each page
@@ -141,25 +136,10 @@ def process_file():
             # 2c: OCR
             yield _sse({
                 'step': 'ocr',
-                'message': f'🔍 Page {page_num}/{total_pages}: Running Tesseract OCR...',
+                'message': f'🔍 Page {page_num}/{total_pages}: Running OCR...',
                 'page': page_num
             })
 
-            # Save debug image to see what Tesseract is seeing
-            debug_path = os.path.join(app.config['UPLOAD_FOLDER'], f"debug_page_{page_num}.png")
-            try:
-                processed.save(debug_path)
-                print(f"🐛 Saved debug image: {debug_path}")
-            except Exception as e:
-                print(f"⚠️ Failed to save debug image: {e}")
-
-            # [CUSTOM MODEL TOGGLE] 
-            # To switch to your newly trained model (once you train it on 5,000+ lines), 
-            # uncomment these next two lines and comment out the default raw_text line below!
-            
-            # custom_config = r'--tessdata-dir "tesstrain/usr/share/tessdata" --oem 3 --psm 1 -c preserve_interword_spaces=1'
-            # raw_text = pytesseract.image_to_string(processed, lang='khm_custom+eng', config=custom_config)
-            
             raw_text = pytesseract.image_to_string(processed, lang='khm+eng', config=config)
 
             # 2d: Post-processing
@@ -221,7 +201,6 @@ def process_file():
             'pages': pages_data,
             'full_text': full_text,
             'preset': preset,
-            'dpi': dpi,
             'ai_corrected': use_ai
         }
         results_store[file_id] = result
@@ -291,6 +270,71 @@ def download_result(file_id):
     return send_file(txt_path, as_attachment=True, download_name=download_name)
 
 
+@app.route('/correct', methods=['POST'])
+def correct_selection():
+    """Use Claude API to correct a selected piece of OCR text."""
+    data = request.json
+    selected = (data.get('selected_text') or '').strip()
+    context  = (data.get('context')       or '').strip()
+
+    if not selected:
+        return jsonify({'error': 'No text selected'}), 400
+
+    # Load API key from .env
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        return jsonify({'error': 'ANTHROPIC_API_KEY not set in .env file'}), 500
+
+    try:
+        import anthropic, json as json_lib
+        client = anthropic.Anthropic(api_key=api_key)
+        prompt = (
+            "You are a Khmer OCR correction expert.\n"
+            "The text below was extracted from a scanned PDF using Tesseract OCR and may contain character-level errors.\n\n"
+            f"Text to analyze:\n{selected}\n\n"
+            "Find specific OCR errors and return ONLY a JSON object in this exact format:\n"
+            "{\n"
+            '  "corrections": [\n'
+            '    {\n'
+            '      "original": "the exact wrong text as it appears in the input",\n'
+            '      "corrected": "the correct replacement",\n'
+            '      "reason": "brief explanation in English"\n'
+            '    }\n'
+            "  ]\n"
+            "}\n\n"
+            "Rules:\n"
+            "- 'original' must be copied exactly from the input text (character-for-character)\n"
+            "- Only include real OCR errors: wrong Khmer characters, missing/wrong diacritics, garbled sequences\n"
+            "- Do NOT include stylistic changes or punctuation preferences\n"
+            "- If the text looks correct, return {\"corrections\": []}\n"
+            "- Return ONLY the JSON object, no markdown, no extra text"
+        )
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = message.content[0].text.strip()
+        # Strip markdown code fences if model wraps in them
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+        result = json_lib.loads(raw)
+        return jsonify(result)
+    except json_lib.JSONDecodeError:
+        return jsonify({'error': 'AI returned invalid JSON. Try again.'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/documents')
 def list_documents():
     """List available PDF documents in the Document/ folder."""
@@ -346,4 +390,4 @@ if __name__ == '__main__':
     print("  📱 Khmer OCR Web UI")
     print("  🌐 Open: http://localhost:5000")
     print("=" * 50)
-    app.run(debug=True, port=5000, threaded=True)
+    app.run(debug=True, port=5001, threaded=True)
