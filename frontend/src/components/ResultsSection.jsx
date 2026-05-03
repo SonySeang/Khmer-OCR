@@ -11,10 +11,10 @@ export default function ResultsSection({ result, onReset }) {
 
   const displayText = tab === 'corrected'
     ? result.full_text
-    : result.pages?.map(p => `--- Page ${p.page} ---\n${p.text}`).join('\n\n') || result.full_text
+    : result.pages?.map(p => `--- Page ${p.page} ---\n${p.raw_text || p.text}`).join('\n\n') || result.full_text
 
   async function copy() {
-    try { await navigator.clipboard.writeText(result.full_text) }
+    try { await navigator.clipboard.writeText(displayText) }
     catch {
       const t = document.createElement('textarea')
       t.value = result.full_text

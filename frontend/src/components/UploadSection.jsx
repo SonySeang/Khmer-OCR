@@ -5,24 +5,27 @@ export default function UploadSection({ onFileReady }) {
   const [docs, setDocs]         = useState(null)
   const [uploading, setUploading] = useState(false)
   const [over, setOver]         = useState(false)
+  const [error, setError]       = useState(null)
   const inputRef                = useRef(null)
 
   useEffect(() => {
     fetch('/documents').then(r => r.json()).then(setDocs).catch(() => setDocs([]))
   }, [])
 
+  function showError(msg) { setError(msg); setTimeout(() => setError(null), 4000) }
+
   async function handleFile(file) {
-    if (!file.name.toLowerCase().endsWith('.pdf')) return alert('Please upload a PDF file.')
-    if (file.size > 20 * 1024 * 1024) return alert('File too large. Max 20MB.')
+    if (!file.name.toLowerCase().endsWith('.pdf')) return showError('Please upload a PDF file.')
+    if (file.size > 20 * 1024 * 1024) return showError('File too large. Max 20MB.')
     setUploading(true)
     const fd = new FormData()
     fd.append('file', file)
     try {
       const r = await fetch('/upload', { method: 'POST', body: fd })
       const d = await r.json()
-      if (d.error) return alert(d.error)
+      if (d.error) return showError(d.error)
       onFileReady(d.file_id, d.filename, d.size)
-    } catch { alert('Upload failed. Please try again.') }
+    } catch { showError('Upload failed. Please try again.') }
     finally { setUploading(false) }
   }
 
@@ -33,9 +36,9 @@ export default function UploadSection({ onFileReady }) {
         body: JSON.stringify({ filename: name })
       })
       const d = await r.json()
-      if (d.error) return alert(d.error)
+      if (d.error) return showError(d.error)
       onFileReady(d.file_id, d.filename, d.size)
-    } catch { alert('Failed to select document.') }
+    } catch { showError('Failed to select document.') }
   }
 
   return (
@@ -44,6 +47,8 @@ export default function UploadSection({ onFileReady }) {
         <h2>Upload Document</h2>
         <p>Drag & drop a PDF or pick from your existing documents</p>
       </div>
+
+      {error && <p className="warn" style={{ marginBottom: '1rem' }}>⚠️ {error}</p>}
 
       <div className="upload-grid">
         {/* Drop zone */}

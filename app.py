@@ -23,8 +23,14 @@ app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), 'uploads')
 # Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# In-memory store for processing results
+# In-memory store for processing results (capped to avoid unbounded growth)
 results_store = {}
+_MAX_RESULTS = 50
+
+def _store_result(file_id, result):
+    if len(results_store) >= _MAX_RESULTS:
+        del results_store[next(iter(results_store))]
+    results_store[file_id] = result
 
 ALLOWED_EXTENSIONS = {'pdf'}
 
@@ -91,7 +97,7 @@ def process_file():
         if os.path.exists(tesseract_path):
             pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
-        config = '--oem 3 --psm 6 -c preserve_interword_spaces=1 -c textord_min_linesize=1.5'
+        config = '--oem 1 --psm 4 -c preserve_interword_spaces=1 -c textord_min_linesize=1.5'
 
         # Step 1: Convert PDF to images
         yield _sse({'step': 'converting', 'message': '📄 Converting PDF to images...'})
@@ -203,7 +209,7 @@ def process_file():
             'preset': preset,
             'ai_corrected': use_ai
         }
-        results_store[file_id] = result
+        _store_result(file_id, result)
 
         yield _sse({
             'step': 'complete',
@@ -216,6 +222,7 @@ def process_file():
                 'pages': [{
                     'page': p['page'],
                     'text': p['text'],
+                    'raw_text': p['raw_text'],
                     'quality': p['quality'],
                     'lines_removed': p['lines_removed'],
                     'char_count': p['char_count']
@@ -358,7 +365,9 @@ def list_documents():
 def process_local_file():
     """Process a PDF from the Document/ folder (for quick testing)."""
     data = request.json
-    filename = data.get('filename')
+    filename = os.path.basename(data.get('filename', ''))
+    if not filename or not filename.lower().endswith('.pdf'):
+        return jsonify({'error': 'Invalid filename'}), 400
     doc_path = os.path.join(os.path.dirname(__file__), 'Document', filename)
 
     if not os.path.exists(doc_path):

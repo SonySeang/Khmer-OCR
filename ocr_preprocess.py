@@ -320,7 +320,60 @@ def postprocess_khmer(text):
     Fix common Tesseract OCR errors specific to Khmer text.
     General-purpose corrections that work for any Khmer PDF document.
     """
-    
+
+    # ---- STEP 0: Form blank-field cleanup ----
+    # Forms use dotted/dashed lines for fill-in blanks (e.g. "...............", "-..-..--..").
+    # Tesseract reads these as literal dots and dashes. Replace with a clean placeholder.
+
+    # Strip special chars that OCR picks up from form decorations
+    text = re.sub(r'[‹›«»©®™°•·]', '', text)
+
+    # 5+ consecutive dots → blank marker
+    text = re.sub(r'\.{5,}', '________', text)
+    # 5+ consecutive dashes → blank marker
+    text = re.sub(r'-{5,}', '________', text)
+
+    # Mixed dot/dash/space sequences (e.g. "- - -- - .", "-..-..-..-..") → blank marker
+    # Check ratio on non-space chars so spaced-out dashes ("- - - -- -") are caught too.
+    def _form_blank(m):
+        s = m.group()
+        non_space = s.replace(' ', '').replace('\t', '')
+        if not non_space:
+            return s
+        dot_dash = non_space.count('.') + non_space.count('-')
+        if dot_dash >= 4 and dot_dash / len(non_space) >= 0.85:
+            return '________'
+        return s
+    text = re.sub(r'[-. ]{8,}', _form_blank, text)
+
+    # Second pass: stray dot/dash runs directly adjacent to blank markers
+    text = re.sub(r'(?<![ក-អ\w])([-. ] *){3,}(?=________)', '________ ', text)
+    text = re.sub(r'(?<=________)( *[-. ]){3,}(?![ក-អ\w])', ' ________', text)
+    # Markers separated only by dots/dashes (no Khmer between them)
+    text = re.sub(r'________[-. ]+________', '________ ', text)
+    # Now collapse any consecutive blank markers (including after above fixes)
+    text = re.sub(r'(________\s*){2,}', '________ ', text)
+    # Clean orphan dash/dots immediately after a blank marker (before Khmer or end of line)
+    text = re.sub(r'(?<=________)\s*[-\.]{1,4}\s*(?=[ក-៿])', ' ', text)
+    text = re.sub(r'________\s*[-\.]{1,4}\s*$', '________', text, flags=re.MULTILINE)
+
+    # Remove short Latin noise tokens that appear between blank markers and Khmer text
+    # e.g. "________ esse  i កើត" → "________ កើត"
+    # e.g. "________ SS a________" → "________ ________"
+    text = re.sub(
+        r'(?<=________)\s+(?:[a-zA-Z]{1,8}\s*){1,4}(?=[ក-៿]|________)',
+        ' ', text
+    )
+
+    # Drop lines that are nothing but blank markers + whitespace → keep as single marker
+    lines_out = []
+    for ln in text.split('\n'):
+        if re.fullmatch(r'[\s________]+', ln.strip()) and '________' in ln:
+            lines_out.append('________')
+        else:
+            lines_out.append(ln)
+    text = '\n'.join(lines_out)
+
     # ---- STEP 1: Line-level cleanup (remove garbage lines) ----
     cleaned_lines = []
     for line in text.split('\n'):
@@ -334,8 +387,8 @@ def postprocess_khmer(text):
         if re.match(r'^\d{1,2}$', stripped):
             continue
         
-        # Remove very short garbage lines (1-2 random characters, not Khmer numbers)
-        if len(stripped) <= 2 and not re.match(r'^[\u1780-\u17FF]', stripped) and stripped not in ('', '•'):
+        # Remove very short lines (1-2 chars) including lone Khmer letters (header artifacts)
+        if len(stripped) <= 2 and stripped not in ('', '•'):
             continue
             
         # Remove footer lines: email addresses, URLs, phone numbers
@@ -358,17 +411,18 @@ def postprocess_khmer(text):
                              'EdTech', 'AI', 'Al', 'IFC', 'NBC', 'CMA', 'STEM', 'KAPE',
                              'Centre', 'Excellence', 'Designer', 'Media', 'MFI', 'NGO',
                              'ASEAN', 'UNESCO', 'UNICEF', 'ADB', 'IMF', 'GDP']
-            is_page_marker = stripped.startswith('--- Page')
-            is_known_eng   = any(eng in stripped for eng in known_english)
+            is_page_marker  = stripped.startswith('--- Page')
+            is_known_eng    = any(eng in stripped for eng in known_english)
+            is_form_blank   = '________' in stripped
 
             # If line has NO Khmer characters at all → drop unless it's a known marker
             if khmer_chars == 0:
-                if not is_known_eng and not is_page_marker and not re.match(r'^[0-9\s\.\,\-\%]+$', stripped):
+                if not is_known_eng and not is_page_marker and not is_form_blank and not re.match(r'^[0-9\s\.\,\-\%]+$', stripped):
                     continue
 
             # If line is longer than 5 chars and has less than 15% Khmer → likely noise
             elif total_chars > 5 and khmer_ratio < 0.15:
-                if not is_known_eng and not is_page_marker:
+                if not is_known_eng and not is_page_marker and not is_form_blank:
                     continue
 
             # Lines with a long ALL-CAPS run → stamp/logo garbage
@@ -501,7 +555,26 @@ def postprocess_khmer(text):
         # Section header fixes
         ('៖ស', 'សេ'),               # ៖ If prefix on សេចក្តី
 
+        # Khmer numeral misread as Latin letter in numbered lists
+        ('G-Copy', '៤-Copy'),
+        ('C-Copy', '៥-Copy'),
+        ('G-copy', '៤-Copy'),
+        ('C-copy', '៥-Copy'),
+
+        # Scholarship form corrections
+        ('សូមេគារពជូន', 'សូមគោរពជូន'),          # Greeting phrase
+        ('ពាក្យេស្លីសុំ', 'ពាក្យសុំ'),           # Form title
+        ('ក្សត្រត្រ', 'ក្សត្រ'),                  # Extra ត្រ at end of royal title
+        ('ម្រិតវំប្បធម៌', 'វប្បធម៌'),            # Education level
+        ('ជ្នៅ', 'នៅ'),                           # Location preposition
+        ('ឃំ-', 'ឃុំ-'),                          # Village (commune)
+        ('ស្រកា"', 'ស្រុក/'),                     # District
+        ('ខណ្ឌ', 'ខណ្ឌ'),                         # Already correct
+        ('ខេត្ត"', 'ខេត្ត/'),                     # Province
+        ('ក្រុង់', 'ក្រុង'),                      # City: stray ់
+
         # Official document header corrections (seen in government PDFs)
+        ('ព្រះរាជាណាចក្រកម្មជា', 'ព្រះរាជាណាចក្រកម្ពុជា'),  # Cambodia: ម្ម → ម្ព
         ('ពាះរាជាណាបក្រ', 'ព្រះរាជាណាចក្រ'),  # Full header phrase fix
         ('ពាះរាជាណា', 'ព្រះរាជាណា'),           # Partial: ពាះ → ព្រះ
         ('ណាបក្រ', 'ណាចក្រ'),                  # ចក្រ misread as បក្រ
@@ -608,7 +681,7 @@ def run_ocr(processed_pil_image):
                 pytesseract.pytesseract.tesseract_cmd = f"{conda_prefix}/bin/tesseract"
     except Exception:
         pass
-    config = '--oem 3 --psm 6 -c preserve_interword_spaces=1 -c textord_min_linesize=1.5'
+    config = '--oem 1 --psm 4 -c preserve_interword_spaces=1 -c textord_min_linesize=1.5'
     return pytesseract.image_to_string(processed_pil_image, lang='khm+eng', config=config)
 
 
