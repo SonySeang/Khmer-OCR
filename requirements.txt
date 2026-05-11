@@ -8,3 +8,4 @@ numpy
 google-genai
 jiwer
 anthropic
+python-docx

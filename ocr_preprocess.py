@@ -92,7 +92,7 @@ def remove_noise(gray, method="bilateral"):
     - 'gaussian': Simple blur
     """
     if method == "bilateral":
-        return cv2.bilateralFilter(gray, 9, 75, 75)
+        return cv2.bilateralFilter(gray, 5, 75, 75)  # d=5 not 9: 3x faster on large images
     elif method == "nlm":
         return cv2.fastNlMeansDenoising(gray, h=10)
     elif method == "gaussian":
@@ -257,10 +257,11 @@ def preprocess_for_ocr(pil_image, preset="auto", upscale_factor=2, verbose=False
                   f"contrast={quality['contrast']}, "
                   f"white={quality['white_ratio']}%)")
 
-    # Use preset-specific upscale factor when caller passes the default (2).
-    # Scan/photo benefit from higher resolution for thin Khmer strokes.
-    if upscale_factor == 2 and preset in ("scan", "photo"):
-        upscale_factor = 3
+    # Skip upscaling if the image is already high-res (300 DPI PDF pages are ~2500x3500px).
+    # Upscaling large images makes bilateral filter take 30-60s; 300 DPI is already optimal for Tesseract.
+    h0, w0 = gray.shape[:2]
+    if h0 * w0 > 2_000_000:
+        upscale_factor = 1
 
     # Upscale
     if upscale_factor > 1:
@@ -290,8 +291,9 @@ def preprocess_for_ocr(pil_image, preset="auto", upscale_factor=2, verbose=False
 
     elif preset == "photo":
         # Photo of document: heavy denoise → gamma → CLAHE → sharpen → otsu → deskew → cleanup
+        # Use bilateral instead of NLM — NLM on large upscaled images hangs for minutes.
         if verbose: print("   ↳ Pipeline: heavy denoise → gamma → CLAHE → sharpen → otsu → deskew → cleanup")
-        denoised = remove_noise(gray, method="nlm")
+        denoised = remove_noise(gray, method="bilateral")
         brightened = gamma_correct(denoised, gamma=1.4)
         enhanced = enhance_contrast(brightened, clip_limit=3.5)
         sharpened = sharpen(enhanced)
@@ -347,8 +349,9 @@ def postprocess_khmer(text):
     text = re.sub(r'[-. ]{8,}', _form_blank, text)
 
     # Second pass: stray dot/dash runs directly adjacent to blank markers
-    text = re.sub(r'(?<![ក-អ\w])([-. ] *){3,}(?=________)', '________ ', text)
-    text = re.sub(r'(?<=________)( *[-. ]){3,}(?![ក-អ\w])', ' ________', text)
+    # NOTE: avoid (group){n,} patterns — they cause catastrophic backtracking on form-heavy pages
+    text = re.sub(r'(?<![ក-អ\w])[-.\s]+(?=________)', '________ ', text)
+    text = re.sub(r'(?<=________)[\s.-]+(?![ក-អ\w])', ' ________', text)
     # Markers separated only by dots/dashes (no Khmer between them)
     text = re.sub(r'________[-. ]+________', '________ ', text)
     # Now collapse any consecutive blank markers (including after above fixes)
