@@ -181,7 +181,13 @@ def _page_thumbnail(pil_img, max_w=560):
     return 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
 
 
-def _confidence(text):
+def _confidence(text, word_confidences=None):
+    # Use real Tesseract word-level confidence scores when available
+    if word_confidences:
+        scores = [c for c in word_confidences.values() if c >= 0]
+        if scores:
+            return round(min(1.0, sum(scores) / len(scores) / 100), 2)
+    # Fallback: Khmer character ratio (used when no Tesseract data)
     chars = [c for c in text if c not in (' ', '\n', '\t')]
     if not chars:
         return 0.0
@@ -205,6 +211,9 @@ def _process_page(img, page_num, total_pages, preset):
 
     config = '--oem 1 --psm 4 -c preserve_interword_spaces=1 -c textord_min_linesize=1.5'
 
+    # Per-stage timing for performance evaluation
+    t_preprocess_start = time.perf_counter()
+
     log.info(f'[page {page_num}] thumbnail...')
     thumbnail  = _page_thumbnail(img)
     log.info(f'[page {page_num}] to array...')
@@ -216,33 +225,89 @@ def _process_page(img, page_num, total_pages, preset):
     log.info(f'[page {page_num}] preset={quality["recommended_preset"]}, preprocess...')
     processed      = preprocess_for_ocr(img, preset=preset)
     log.info(f'[page {page_num}] preprocess done, size={np.array(processed).shape}, tesseract...')
+    t_preprocess_end = time.perf_counter()
+    t_tess_start = t_preprocess_end
+
+    def _run_tess(cfg, timeout):
+        from pytesseract import Output as TessOut
+        data = pytesseract.image_to_data(
+            processed, lang='khm+eng', config=cfg,
+            output_type=TessOut.DICT, timeout=timeout
+        )
+        lines, confs = {}, {}
+        for i, word in enumerate(data['text']):
+            w = str(word).strip()
+            c = int(data['conf'][i])
+            if not w:
+                continue
+            key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+            lines.setdefault(key, []).append(w)
+            if c >= 0:
+                wl = w.lower()
+                if wl not in confs or c < confs[wl]:
+                    confs[wl] = c
+        return '\n'.join(' '.join(ws) for ws in lines.values()), confs
+
+    raw_text, word_confidences = '', {}
     try:
-        raw_text = pytesseract.image_to_string(processed, lang='khm+eng', config=config, timeout=25)
+        raw_text, word_confidences = _run_tess(config, 25)
     except RuntimeError:
         log.warning(f'[page {page_num}] Tesseract timed out, retrying with psm 3...')
         try:
-            raw_text = pytesseract.image_to_string(processed, lang='khm+eng', config='--oem 1 --psm 3', timeout=20)
+            raw_text, word_confidences = _run_tess('--oem 1 --psm 3', 20)
         except (RuntimeError, Exception):
             log.warning(f'[page {page_num}] Fallback also timed out, skipping page')
-            raw_text = ''
     except Exception:
-        raw_text = ''
+        pass
     log.info(f'[page {page_num}] tesseract done, chars={len(raw_text)}')
+    t_tess_end = time.perf_counter()
+    t_post_start = t_tess_end
+
     corrected_text = postprocess_khmer(raw_text)
     corrected_text = _apply_user_corrections(corrected_text)
+    t_post_end = time.perf_counter()
+
+    # Suspicious words = low confidence AND not auto-corrected by postprocess.
+    # Pure confidence flags too many correct Khmer words (Tesseract scores Khmer low
+    # even when correct). Diffing raw vs corrected lets us exclude words that were
+    # already fixed, leaving only genuinely uncertain ones.
+    import difflib
+    raw_tokens  = [w for w in raw_text.split()       if w.strip()]
+    corr_tokens = [w for w in corrected_text.split() if w.strip()]
+    unchanged_in_corr = set()
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+        None,
+        [w.lower() for w in raw_tokens],
+        [w.lower() for w in corr_tokens],
+        autojunk=False,
+    ).get_opcodes():
+        if tag == 'equal':
+            unchanged_in_corr.update(w.lower() for w in corr_tokens[j1:j2])
+    # Only flag unchanged words whose Tesseract confidence is very low
+    suspicious_words = {
+        w: c for w, c in word_confidences.items()
+        if w in unchanged_in_corr and c < 45
+    }
 
     raw_lines  = len(raw_text.strip().split('\n'))
     corr_lines = len(corrected_text.strip().split('\n'))
 
     return {
-        'page':          page_num,
-        'text':          corrected_text,
-        'raw_text':      raw_text,
-        'quality':       quality,
-        'lines_removed': max(0, raw_lines - corr_lines),
-        'char_count':    len(corrected_text),
-        'confidence':    _confidence(corrected_text),
-        'thumbnail':     thumbnail,
+        'page':             page_num,
+        'text':             corrected_text,
+        'raw_text':         raw_text,
+        'quality':          quality,
+        'lines_removed':    max(0, raw_lines - corr_lines),
+        'char_count':       len(corrected_text),
+        'confidence':       _confidence(corrected_text, word_confidences),
+        'thumbnail':        thumbnail,
+        'word_confidences': suspicious_words,
+        'timings': {
+            'preprocess_s':  round(t_preprocess_end - t_preprocess_start, 2),
+            'tesseract_s':   round(t_tess_end - t_tess_start, 2),
+            'postprocess_s': round(t_post_end - t_post_start, 2),
+            'total_s':       round(t_post_end - t_preprocess_start, 2),
+        },
     }
 
 
@@ -285,10 +350,10 @@ def upload_file():
 # ── Process (SSE stream) ────────────────────────────────────────────
 @app.route('/process', methods=['POST'])
 def process_file():
-    data    = request.json
-    file_id = data.get('file_id')
-    preset  = data.get('preset', 'auto')
-    use_ai  = data.get('use_ai', False)
+    data        = request.json
+    file_id     = data.get('file_id')
+    preset      = data.get('preset', 'auto')
+    use_ai      = data.get('use_ai', False)
 
     upload_dir = app.config['UPLOAD_FOLDER']
     matching   = [f for f in os.listdir(upload_dir) if f.startswith(file_id)]
@@ -482,7 +547,7 @@ def download_docx(file_id):
     return send_file(docx_path, as_attachment=True, download_name=name)
 
 
-# ── Inline AI correction (Gemini) ──────────────────────────────────
+# ── Inline AI correction (Gemini or Claude) ────────────────────────
 @app.route('/correct', methods=['POST'])
 def correct_selection():
     data     = request.json
@@ -490,31 +555,43 @@ def correct_selection():
     if not selected:
         return jsonify({'error': 'No text selected'}), 400
 
-    api_key = os.environ.get('GOOGLE_API_KEY')
-    if not api_key:
-        return jsonify({'error': 'GOOGLE_API_KEY not set in .env file'}), 500
+    provider = os.environ.get('AI_PROVIDER', 'gemini').lower()
+    prompt = (
+        "You are a Khmer OCR correction expert.\n"
+        "The text below was extracted from a scanned PDF using Tesseract OCR.\n\n"
+        f"Text to analyze:\n{selected}\n\n"
+        'Return ONLY a JSON object: {"corrections":[{"original":"exact wrong text",'
+        '"corrected":"correct replacement","reason":"brief explanation"}]}\n\n'
+        "Rules:\n"
+        "- 'original' must be copied exactly from the input\n"
+        "- Only real OCR errors (wrong chars, missing diacritics)\n"
+        "- No stylistic changes\n"
+        "- If text is correct, return {\"corrections\":[]}\n"
+        "- Return ONLY the JSON, no markdown, no code fences"
+    )
 
     try:
-        from google import genai
-        client = genai.Client(api_key=api_key)
-        prompt = (
-            "You are a Khmer OCR correction expert.\n"
-            "The text below was extracted from a scanned PDF using Tesseract OCR.\n\n"
-            f"Text to analyze:\n{selected}\n\n"
-            'Return ONLY a JSON object: {"corrections":[{"original":"exact wrong text",'
-            '"corrected":"correct replacement","reason":"brief explanation"}]}\n\n'
-            "Rules:\n"
-            "- 'original' must be copied exactly from the input\n"
-            "- Only real OCR errors (wrong chars, missing diacritics)\n"
-            "- No stylistic changes\n"
-            "- If text is correct, return {\"corrections\":[]}\n"
-            "- Return ONLY the JSON, no markdown, no code fences"
-        )
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=prompt
-        )
-        raw = response.text.strip()
+        if provider == 'claude':
+            api_key = os.environ.get('ANTHROPIC_API_KEY')
+            if not api_key:
+                return jsonify({'error': 'ANTHROPIC_API_KEY not set in .env file'}), 500
+            import anthropic as _anthropic
+            _client = _anthropic.Anthropic(api_key=api_key)
+            response = _client.messages.create(
+                model='claude-haiku-4-5',
+                max_tokens=2048,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+            raw = response.content[0].text.strip()
+        else:
+            api_key = os.environ.get('GOOGLE_API_KEY')
+            if not api_key:
+                return jsonify({'error': 'GOOGLE_API_KEY not set in .env file'}), 500
+            from google import genai as _genai
+            _client = _genai.Client(api_key=api_key)
+            response = _client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            raw = response.text.strip()
+
         if raw.startswith('```'):
             raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
         return jsonify(json.loads(raw))

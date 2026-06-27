@@ -43,21 +43,6 @@ export default function SettingsSection({ filename, fileSize, preset, setPreset,
           </div>
         </div>
 
-        {/* AI toggle */}
-        <div className="card">
-          <p className="label-cap">AI Correction</p>
-          <div className="toggle-wrap">
-            <label className="toggle">
-              <input type="checkbox" checked={useAi} onChange={e => setUseAi(e.target.checked)} />
-              <span className="track" />
-            </label>
-            <div className="toggle-label">
-              <p>Google Gemini AI</p>
-              <p>Fix complex OCR errors with AI</p>
-            </div>
-          </div>
-          {useAi && <p className="warn">⚠️ Requires GOOGLE_API_KEY in your .env file</p>}
-        </div>
       </div>
 
       <button className="btn btn-primary btn-lg" onClick={onProcess}>

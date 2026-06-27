@@ -116,20 +116,6 @@ export default function BatchSection({ files, preset, setPreset, useAi, setUseAi
               ))}
             </div>
           </div>
-          <div className="card">
-            <p className="label-cap">AI Correction</p>
-            <div className="toggle-wrap">
-              <label className="toggle">
-                <input type="checkbox" checked={useAi} onChange={e => setUseAi(e.target.checked)} />
-                <span className="track" />
-              </label>
-              <div className="toggle-label">
-                <p>Google Gemini AI</p>
-                <p>Fix complex OCR errors with AI</p>
-              </div>
-            </div>
-            {useAi && <p className="warn">⚠️ Requires GOOGLE_API_KEY in .env</p>}
-          </div>
         </div>
       )}
 

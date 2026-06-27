@@ -456,9 +456,10 @@ def postprocess_khmer(text):
     result = re.sub(r'1 IN Sits inns', '', result)
     result = re.sub(r'1 ដូចនេះ', 'ដូចនេះ', result)
 
-    # Remove long runs of ALL-CAPS garbage embedded inside valid lines
+    # Remove ALL-CAPS garbage embedded inside valid lines (even 2-word sequences)
+    # e.g. "ការណ៍ HALAS HAD ក្រសួង" → "ការណ៍ ក្រសួង"
     # e.g. "ការណ៍ HSAISESMSMS AULHAIM ក្រសួង" → "ការណ៍ ក្រសួង"
-    result = re.sub(r'\b[A-Z]{4,}(?:\s+[A-Z]{2,}){2,}\b', '', result)
+    result = re.sub(r'\b[A-Z]{3,}(?:\s+[A-Z]{2,})+\b', '', result)
 
     # Remove long lowercase Latin garbage runs inside valid Khmer lines
     # e.g. "snstmnaimado sunt ynesinge ភ្នំពេញ" → "ភ្នំពេញ"
@@ -486,6 +487,8 @@ def postprocess_khmer(text):
     # Strip leading short Latin/digit noise before Khmer content on same line
     # e.g. "EM. ការ..." → "ការ...",  "7 a  ជាតិ" → "ជាតិ"
     result = re.sub(r'^[A-Za-z0-9]{1,4}[\.\s]*(?=[\u1780-\u17FF])', '', result, flags=re.MULTILINE)
+    # Long multi-word: "AMV AAAs AHA wits និងកីឡា" → "និងកីឡា"
+    result = re.sub(r'^(?:[A-Za-z][A-Za-z0-9]*\s+){2,}(?=[\u1780-\u17FF])', '', result, flags=re.MULTILINE)
     # Catch patterns like "7 a  ជាតិ" — digit + whitespace + short latin + whitespace before Khmer
     result = re.sub(r'^\d{1,2}\s+[A-Za-z]{1,3}\s+(?=[\u1780-\u17FF])', '', result, flags=re.MULTILINE)
     # Also handle bare digit(s) + whitespace before Khmer
@@ -508,6 +511,11 @@ def postprocess_khmer(text):
         
         # Common missing vowels
         ('ក្នង', 'ក្នុង'),           # Missing ុ
+        ('ចពោះ', 'ចំពោះ'),           # Missing ំ vowel
+        ('ក្ដុង', 'ក្នុង'),           # ក្ដ misread as ក្ន
+        ('ខ្ញំ', 'ខ្ញុំ'),              # Missing ុ in I/me
+        ('ការរំពួក', 'ការរំឭក'),       # Misread word
+        ('រំពួក', 'រំឭក'),             # Misread variant
         ('ព្រមទាង', 'ព្រមទាំង'),     # Missing ំ
         ('ដំណេរ', 'ដំណើរ'),         # Missing ើ
         ('ស័ក្សា', 'សិក្សា'),         # Vowel confusion
@@ -719,8 +727,55 @@ def read_pdf_improved(filename, dpi=300, preset="auto", apply_postprocess=True, 
 
 
 # ============================================================
-# PHASE 3: AI TEXT CORRECTION (Google Gemini)
+# PHASE 3: AI TEXT CORRECTION (Gemini or Claude)
+# Switch provider by setting AI_PROVIDER=claude or AI_PROVIDER=gemini in .env
 # ============================================================
+def _correct_with_gemini(text, key, prompt):
+    from google import genai
+    import time
+    client = genai.Client(api_key=key)
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            return response.text
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "exceeded your current quota" in error_str:
+                if attempt < 2:
+                    wait_time = 4 * (attempt + 1)
+                    print(f"⏳ Gemini Quota hit. Waiting {wait_time}s before retry ({attempt+1}/3)...")
+                    time.sleep(wait_time)
+                    continue
+            print(f"⚠️ Gemini correction failed: {e}")
+            return text
+    return text
+
+
+def _correct_with_claude(text, key, prompt):
+    import anthropic, time
+    client = anthropic.Anthropic(api_key=key)
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model='claude-haiku-4-5',
+                max_tokens=8096,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+            return response.content[0].text
+        except anthropic.RateLimitError:
+            if attempt < 2:
+                wait_time = 4 * (attempt + 1)
+                print(f"⏳ Claude rate limit. Waiting {wait_time}s before retry ({attempt+1}/3)...")
+                time.sleep(wait_time)
+                continue
+            print("⚠️ Claude correction failed: rate limit exceeded.")
+            return text
+        except Exception as e:
+            print(f"⚠️ Claude correction failed: {e}")
+            return text
+    return text
+
+
 def correct_with_ai(text, api_key=None, model="gemini-2.0-flash"):
     """
     Use Google Gemini AI to fix OCR errors in Khmer text.
@@ -737,9 +792,8 @@ def correct_with_ai(text, api_key=None, model="gemini-2.0-flash"):
         str: Corrected text
     """
     import os
-    from google import genai
-    
-    # Load API key from .env file (no extra dependency needed)
+
+    # Load .env file
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -748,18 +802,11 @@ def correct_with_ai(text, api_key=None, model="gemini-2.0-flash"):
                 if line and not line.startswith('#') and '=' in line:
                     k, v = line.split('=', 1)
                     os.environ.setdefault(k.strip(), v.strip().strip("'\""))
-    
-    key = api_key or os.environ.get('GOOGLE_API_KEY')
-    if not key:
-        print("❌ No API key! Set GOOGLE_API_KEY environment variable or pass api_key parameter.")
-        print("   Example: export GOOGLE_API_KEY='your-key-here'")
-        return text
-    
-    # Create client
-    client = genai.Client(api_key=key)
-    
-    prompt = f"""You are a Khmer OCR error correction expert. 
-The following text was extracted from a PDF using Tesseract OCR. 
+
+    provider = os.environ.get('AI_PROVIDER', 'gemini').lower()
+
+    prompt = f"""You are a Khmer OCR error correction expert.
+The following text was extracted from a PDF using Tesseract OCR.
 It contains errors specific to Khmer script OCR.
 
 RULES:
@@ -773,28 +820,19 @@ RULES:
 
 TEXT TO CORRECT:
 {text}"""
-    
-    import time
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt
-            )
-            return response.text
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "exceeded your current quota" in error_str:
-                if attempt < max_retries - 1:
-                    wait_time = 4 * (attempt + 1) # Wait 4s, 8s, etc.
-                    print(f"⏳ Gemini Quota hit. Waiting {wait_time}s before retry ({attempt+1}/{max_retries})...")
-                    time.sleep(wait_time)
-                    continue
-            
-            print(f"⚠️ AI correction failed: {e}")
-            print("   Returning text with only post-processing corrections.")
+
+    if provider == 'claude':
+        key = api_key or os.environ.get('ANTHROPIC_API_KEY')
+        if not key:
+            print("❌ Set ANTHROPIC_API_KEY in .env to use Claude.")
             return text
+        return _correct_with_claude(text, key, prompt)
+    else:
+        key = api_key or os.environ.get('GOOGLE_API_KEY')
+        if not key:
+            print("❌ Set GOOGLE_API_KEY in .env to use Gemini.")
+            return text
+        return _correct_with_gemini(text, key, prompt)
 
 
 def read_pdf_with_ai(filename, api_key=None, dpi=300, preset="auto", verbose=True):
@@ -829,3 +867,5 @@ def read_pdf_with_ai(filename, api_key=None, dpi=300, preset="auto", verbose=Tru
         print("✅ AI correction complete!")
     
     return corrected
+
+

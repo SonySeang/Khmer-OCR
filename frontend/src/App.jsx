@@ -22,8 +22,8 @@ export default function App() {
   const [fileId,   setFileId]   = useState(null)
   const [name,     setName]     = useState(null)
   const [size,     setSize]     = useState(null)
-  const [preset,   setPreset]   = useState('auto')
-  const [useAi,    setUseAi]    = useState(false)
+  const [preset,     setPreset]     = useState('auto')
+  const [useAi,      setUseAi]      = useState(false)
   const [logs,     setLogs]     = useState([])
   const [progress, setProgress] = useState(0)
   const [result,   setResult]   = useState(null)
@@ -117,8 +117,8 @@ export default function App() {
         {view === V.SETTINGS && (
           <SettingsSection
             filename={name} fileSize={size}
-            preset={preset} setPreset={setPreset}
-            useAi={useAi}   setUseAi={setUseAi}
+            preset={preset}       setPreset={setPreset}
+            useAi={useAi}         setUseAi={setUseAi}
             onRemove={onRemove} onProcess={onProcess}
           />
         )}

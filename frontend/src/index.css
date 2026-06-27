@@ -429,6 +429,18 @@ body::before {
 /* ─── API info card ───────────────────────────────────── */
 .api-block { background:rgba(0,0,0,.4); border:1px solid var(--border); border-radius:var(--r); padding:.85rem 1rem; font-size:.74rem; font-family:'Courier New',monospace; color:var(--txt-2); white-space:pre; overflow-x:auto; margin-top:.5rem; }
 
+/* ─── Word confidence highlights ─────────────────────── */
+.highlight-view { padding: 1rem; min-height: 200px; cursor: text; user-select: text; }
+.hl-line        { margin: 0 0 .3em; line-height: 2.1; word-break: break-word; }
+.mark-yellow    { background: rgba(255, 210, 0, 0.38); border-radius: 3px; padding: 1px 2px; cursor: default; text-decoration: underline dotted rgba(200,160,0,.7); }
+.mark-red       { background: rgba(255, 70,  70, 0.38); border-radius: 3px; padding: 1px 2px; cursor: default; text-decoration: underline dotted rgba(200,40,40,.8); }
+.mark-yellow:hover { background: rgba(255, 210, 0, 0.60); }
+.mark-red:hover    { background: rgba(255, 70,  70, 0.60); }
+.hl-legend      { display: flex; align-items: center; gap: .9rem; flex-wrap: wrap; padding: .45rem .75rem; background: rgba(255,255,255,.03); border-bottom: 1px solid var(--border); font-size: .68rem; }
+.hl-key         { display: flex; align-items: center; gap: .3rem; font-weight: 500; }
+.hl-key-yellow  { color: #d4a800; }
+.hl-key-red     { color: #e05555; }
+
 /* ─── Responsive additions ────────────────────────────── */
 @media (max-width:680px) {
   .corr-item { grid-template-columns:1fr; }
