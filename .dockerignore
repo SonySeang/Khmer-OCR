@@ -1,0 +1,45 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment / secrets
+.env
+*.env
+
+# Local data (rebuilt fresh in container)
+uploads/
+history.db
+corrections.json
+
+# Frontend source (only the build output is needed)
+frontend/node_modules/
+frontend/src/
+frontend/public/
+frontend/.gitignore
+frontend/eslint.config.js
+frontend/vite.config.js
+frontend/index.html
+frontend/README.md
+
+# Git
+.git/
+.gitignore
+
+# Docs and reports (not needed in container)
+*.md
+*.pdf
+*.docx
+Document/
+CHANGELOG.md
+REPORT.md
+compare.md
+Weekly*
+
+# IDE
+.claude/
+*.code-workspace
+.vscode/

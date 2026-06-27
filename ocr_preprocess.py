@@ -46,12 +46,18 @@ def detect_image_quality(gray_img):
     white_ratio = np.mean(gray_img > 200) * 100
     
     # Decision logic
-    if white_ratio > 60 and contrast > 60:
-        # Lots of white background, good contrast = clean digital PDF
+    # NOTE: sharp digital PDFs have HIGH Laplacian (crisp edges), same as noisy photos.
+    # white_ratio is the most reliable discriminator — check it first.
+    if white_ratio > 75:
+        # Very white background = clean digital PDF (even if Laplacian is high)
+        preset = "clean"
+        is_clean = True
+    elif white_ratio > 50 and contrast > 50:
+        # Moderate white with decent contrast = clean-ish PDF
         preset = "clean"
         is_clean = True
     elif noise_level > 2000:
-        # Very noisy = photo of document
+        # High noise AND low white ratio = photo of document
         preset = "photo"
         is_clean = False
     else:
@@ -86,7 +92,7 @@ def remove_noise(gray, method="bilateral"):
     - 'gaussian': Simple blur
     """
     if method == "bilateral":
-        return cv2.bilateralFilter(gray, 9, 75, 75)
+        return cv2.bilateralFilter(gray, 5, 75, 75)  # d=5 not 9: 3x faster on large images
     elif method == "nlm":
         return cv2.fastNlMeansDenoising(gray, h=10)
     elif method == "gaussian":
@@ -150,6 +156,26 @@ def morphological_cleanup(binary):
     return cleaned
 
 
+def sharpen(gray):
+    """
+    Unsharp masking to enhance character edges.
+    Critical for thin Khmer vowel marks and diacritics.
+    """
+    blurred = cv2.GaussianBlur(gray, (0, 0), 3)
+    return cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+
+
+def gamma_correct(gray, gamma=1.2):
+    """
+    Gamma correction to brighten dark scanned documents.
+    Gamma > 1 brightens midtones; use 1.2–1.5 for dark scans.
+    """
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255
+                      for i in range(256)], dtype="uint8")
+    return cv2.LUT(gray, table)
+
+
 def crop_to_main_text_body(binary_img):
     """
     Document Layout Analysis: Finds the main text contours and crops out 
@@ -207,26 +233,21 @@ def preprocess_for_ocr(pil_image, preset="auto", upscale_factor=2, verbose=False
     """
     Smart preprocessing pipeline. Auto-detects document quality
     and applies the right combination of techniques.
-    
+
     Presets:
         - 'auto': Detect quality and choose best pipeline
         - 'clean': Minimal processing for clean digital PDFs
         - 'scan': Moderate processing for scanned documents
         - 'photo': Heavy processing for photos of documents
-    
+
     Returns:
         PIL Image: Preprocessed image ready for Tesseract
     """
     img = np.array(pil_image)
     gray = to_grayscale(img)
-    
-    # Upscale
-    if upscale_factor > 1:
-        if verbose: print(f"   ↳ Upscaling {upscale_factor}x...")
-        gray = cv2.resize(gray, None, fx=upscale_factor, fy=upscale_factor,
-                         interpolation=cv2.INTER_CUBIC)
-    
-    # Auto-detect quality if preset is "auto"
+
+    # Auto-detect quality on the ORIGINAL image (before upscaling)
+    # so noise/contrast metrics are not skewed by interpolation.
     if preset == "auto":
         quality = detect_image_quality(gray)
         preset = quality['recommended_preset']
@@ -235,40 +256,61 @@ def preprocess_for_ocr(pil_image, preset="auto", upscale_factor=2, verbose=False
                   f"(noise={quality['noise_level']}, "
                   f"contrast={quality['contrast']}, "
                   f"white={quality['white_ratio']}%)")
-    
+
+    # Skip upscaling if the image is already high-res (300 DPI PDF pages are ~2500x3500px).
+    # Upscaling large images makes bilateral filter take 30-60s; 300 DPI is already optimal for Tesseract.
+    h0, w0 = gray.shape[:2]
+    if h0 * w0 > 2_000_000:
+        upscale_factor = 1
+
+    # Upscale
+    if upscale_factor > 1:
+        if verbose: print(f"   ↳ Upscaling {upscale_factor}x...")
+        gray = cv2.resize(gray, None, fx=upscale_factor, fy=upscale_factor,
+                         interpolation=cv2.INTER_CUBIC)
+
     # Apply preset-specific pipeline
     if preset == "clean":
-        # Clean digital PDF: minimal processing to avoid introducing artifacts
-        if verbose: print("   ↳ Pipeline: adaptive threshold (light touch)")
-        binary = binarize(gray, method="adaptive")
+        # sharpen → otsu → deskew: empirically best for clean digital PDFs.
+        # Bilateral + adaptive over-processes crisp text and hurts thin Khmer strokes.
+        if verbose: print("   ↳ Pipeline: sharpen → otsu → deskew")
+        sharpened = sharpen(gray)
+        binary = binarize(sharpened, method="otsu")
         binary = deskew(binary)
-    
+
     elif preset == "scan":
-        # Scanned document: moderate denoising + CLAHE + adaptive
-        if verbose: print("   ↳ Pipeline: denoise → CLAHE → adaptive → deskew → cleanup")
+        # Scanned document: denoise → gamma → CLAHE → sharpen → adaptive → deskew → cleanup
+        if verbose: print("   ↳ Pipeline: denoise → gamma → CLAHE → sharpen → adaptive → deskew → cleanup")
         denoised = remove_noise(gray, method="bilateral")
-        enhanced = enhance_contrast(denoised, clip_limit=2.0)
-        binary = binarize(enhanced, method="adaptive")
+        brightened = gamma_correct(denoised, gamma=1.3)
+        enhanced = enhance_contrast(brightened, clip_limit=2.5)
+        sharpened = sharpen(enhanced)
+        binary = binarize(sharpened, method="adaptive")
         binary = deskew(binary)
         binary = morphological_cleanup(binary)
-    
+
     elif preset == "photo":
-        # Photo of document: heavy denoising + CLAHE + morphology
-        if verbose: print("   ↳ Pipeline: heavy denoise → CLAHE → otsu → deskew → cleanup")
-        denoised = remove_noise(gray, method="nlm")
-        enhanced = enhance_contrast(denoised, clip_limit=3.0)
-        binary = binarize(enhanced, method="otsu")
+        # Photo of document: heavy denoise → gamma → CLAHE → sharpen → otsu → deskew → cleanup
+        # Use bilateral instead of NLM — NLM on large upscaled images hangs for minutes.
+        if verbose: print("   ↳ Pipeline: heavy denoise → gamma → CLAHE → sharpen → otsu → deskew → cleanup")
+        denoised = remove_noise(gray, method="bilateral")
+        brightened = gamma_correct(denoised, gamma=1.4)
+        enhanced = enhance_contrast(brightened, clip_limit=3.5)
+        sharpened = sharpen(enhanced)
+        binary = binarize(sharpened, method="otsu")
         binary = deskew(binary)
         binary = morphological_cleanup(binary)
-    
+
     else:
         # Fallback
         binary = binarize(gray, method="adaptive")
-        
-    # Final step: Crop to main text body to remove headers/footers
-    if verbose: print("   ↳ Layout Analysis: cropping edge noise...")
-    binary = crop_to_main_text_body(binary)
-    
+
+    # Crop to main text body: skip for clean PDFs (headers/footers are valid text
+    # in digital docs; the crop can cut off legitimate content).
+    if preset in ("scan", "photo"):
+        if verbose: print("   ↳ Layout Analysis: cropping edge noise...")
+        binary = crop_to_main_text_body(binary)
+
     return Image.fromarray(binary)
 
 
@@ -280,7 +322,61 @@ def postprocess_khmer(text):
     Fix common Tesseract OCR errors specific to Khmer text.
     General-purpose corrections that work for any Khmer PDF document.
     """
-    
+
+    # ---- STEP 0: Form blank-field cleanup ----
+    # Forms use dotted/dashed lines for fill-in blanks (e.g. "...............", "-..-..--..").
+    # Tesseract reads these as literal dots and dashes. Replace with a clean placeholder.
+
+    # Strip special chars that OCR picks up from form decorations
+    text = re.sub(r'[‹›«»©®™°•·]', '', text)
+
+    # 5+ consecutive dots → blank marker
+    text = re.sub(r'\.{5,}', '________', text)
+    # 5+ consecutive dashes → blank marker
+    text = re.sub(r'-{5,}', '________', text)
+
+    # Mixed dot/dash/space sequences (e.g. "- - -- - .", "-..-..-..-..") → blank marker
+    # Check ratio on non-space chars so spaced-out dashes ("- - - -- -") are caught too.
+    def _form_blank(m):
+        s = m.group()
+        non_space = s.replace(' ', '').replace('\t', '')
+        if not non_space:
+            return s
+        dot_dash = non_space.count('.') + non_space.count('-')
+        if dot_dash >= 4 and dot_dash / len(non_space) >= 0.85:
+            return '________'
+        return s
+    text = re.sub(r'[-. ]{8,}', _form_blank, text)
+
+    # Second pass: stray dot/dash runs directly adjacent to blank markers
+    # NOTE: avoid (group){n,} patterns — they cause catastrophic backtracking on form-heavy pages
+    text = re.sub(r'(?<![ក-អ\w])[-.\s]+(?=________)', '________ ', text)
+    text = re.sub(r'(?<=________)[\s.-]+(?![ក-អ\w])', ' ________', text)
+    # Markers separated only by dots/dashes (no Khmer between them)
+    text = re.sub(r'________[-. ]+________', '________ ', text)
+    # Now collapse any consecutive blank markers (including after above fixes)
+    text = re.sub(r'(________\s*){2,}', '________ ', text)
+    # Clean orphan dash/dots immediately after a blank marker (before Khmer or end of line)
+    text = re.sub(r'(?<=________)\s*[-\.]{1,4}\s*(?=[ក-៿])', ' ', text)
+    text = re.sub(r'________\s*[-\.]{1,4}\s*$', '________', text, flags=re.MULTILINE)
+
+    # Remove short Latin noise tokens that appear between blank markers and Khmer text
+    # e.g. "________ esse  i កើត" → "________ កើត"
+    # e.g. "________ SS a________" → "________ ________"
+    text = re.sub(
+        r'(?<=________)\s+(?:[a-zA-Z]{1,8}\s*){1,4}(?=[ក-៿]|________)',
+        ' ', text
+    )
+
+    # Drop lines that are nothing but blank markers + whitespace → keep as single marker
+    lines_out = []
+    for ln in text.split('\n'):
+        if re.fullmatch(r'[\s________]+', ln.strip()) and '________' in ln:
+            lines_out.append('________')
+        else:
+            lines_out.append(ln)
+    text = '\n'.join(lines_out)
+
     # ---- STEP 1: Line-level cleanup (remove garbage lines) ----
     cleaned_lines = []
     for line in text.split('\n'):
@@ -294,10 +390,19 @@ def postprocess_khmer(text):
         if re.match(r'^\d{1,2}$', stripped):
             continue
         
-        # Remove very short garbage lines (1-2 random characters, not Khmer numbers)
-        if len(stripped) <= 2 and not re.match(r'^[\u1780-\u17FF]', stripped) and stripped not in ('', '•'):
+        # Remove very short lines (1-2 chars) including lone Khmer letters (header artifacts)
+        if len(stripped) <= 2 and stripped not in ('', '•'):
             continue
             
+        # Remove footer lines: email addresses, URLs, phone numbers
+        if re.search(r'[\w\.\-]+@[\w\.\-]+\.\w{2,}', stripped):
+            continue
+        if re.search(r'\bwww\.\w+\.\w+', stripped, re.I):
+            continue
+        # Phone number lines: colon + digit clusters (e.g. ": ៨៥៥ ២) ២២០ ...")
+        if re.search(r':\s*[\d៨៥៤៣២១០\(\)\s]{10,}', stripped) and stripped.count(':') >= 2:
+            continue
+
         # Count Khmer characters vs Total characters
         khmer_chars = len(re.findall(r'[\u1780-\u17FF]', stripped))
         total_chars = len(stripped)
@@ -305,18 +410,40 @@ def postprocess_khmer(text):
         # Remove lines that are mostly English garbage or symbols (common with graphs/noise)
         if total_chars > 0:
             khmer_ratio = khmer_chars / total_chars
-            
-            # If line is longer than 5 chars and has less than 15% Khmer chars, it's likely noise
-            if total_chars > 5 and khmer_ratio < 0.15:
-                # Keep lines with known useful content (page markers, known English names)
-                known_english = ['MSME', 'ChatGPT', 'Gemini', 'Claude', 'Copilot', 'JOTA', 'EdTech', 'AI', 'Al', 'IFC', 'NBC', 'CMA']
-                if not any(eng in stripped for eng in known_english) and not stripped.startswith('--- Page'):
+            known_english = ['MSME', 'ChatGPT', 'Gemini', 'Claude', 'Copilot', 'JOTA',
+                             'EdTech', 'AI', 'Al', 'IFC', 'NBC', 'CMA', 'STEM', 'KAPE',
+                             'Centre', 'Excellence', 'Designer', 'Media', 'MFI', 'NGO',
+                             'ASEAN', 'UNESCO', 'UNICEF', 'ADB', 'IMF', 'GDP']
+            is_page_marker  = stripped.startswith('--- Page')
+            is_known_eng    = any(eng in stripped for eng in known_english)
+            is_form_blank   = '________' in stripped
+
+            # If line has NO Khmer characters at all → drop unless it's a known marker
+            if khmer_chars == 0:
+                if not is_known_eng and not is_page_marker and not is_form_blank and not re.match(r'^[0-9\s\.\,\-\%]+$', stripped):
                     continue
-            
-            # If line has NO Khmer characters at all
-            elif khmer_chars == 0:
-                known_english = ['MSME', 'ChatGPT', 'Gemini', 'Claude', 'Copilot', 'JOTA', 'EdTech', 'AI', 'Al', 'IFC', 'NBC', 'CMA']
-                if not any(eng in stripped for eng in known_english) and not stripped.startswith('--- Page') and not re.match(r'^[0-9\s\.\,\-\%]+$', stripped):
+
+            # If line is longer than 5 chars and has less than 15% Khmer → likely noise
+            elif total_chars > 5 and khmer_ratio < 0.15:
+                if not is_known_eng and not is_page_marker and not is_form_blank:
+                    continue
+
+            # Lines with a long ALL-CAPS run → stamp/logo garbage
+            elif re.search(r'[A-Z]{6,}', stripped) and khmer_ratio < 0.35:
+                if not is_known_eng and not is_page_marker:
+                    continue
+
+            # Lines with 2+ separate ALL-CAPS words (e.g. "CRBS SHAE ក កក") → graphic noise
+            allcaps_words = re.findall(r'\b[A-Z]{3,}\b', stripped)
+            if len(allcaps_words) >= 2 and khmer_ratio < 0.30:
+                if not is_known_eng and not is_page_marker:
+                    continue
+
+            # Lines where Latin letters dominate (>70%) and Khmer is sparse (<20%)
+            # → random noise row (e.g. "snstmnaimado sunt ynesinge ភ្នំពេញ")
+            latin_chars = len(re.findall(r'[a-zA-Z]', stripped))
+            if total_chars > 8 and latin_chars / total_chars > 0.70 and khmer_ratio < 0.20:
+                if not is_known_eng and not is_page_marker:
                     continue
         
         cleaned_lines.append(line)
@@ -328,6 +455,53 @@ def postprocess_khmer(text):
     result = re.sub(r'ANEANitniimia\s*', '', result)
     result = re.sub(r'1 IN Sits inns', '', result)
     result = re.sub(r'1 ដូចនេះ', 'ដូចនេះ', result)
+
+    # Remove ALL-CAPS garbage embedded inside valid lines (even 2-word sequences)
+    # e.g. "ការណ៍ HALAS HAD ក្រសួង" → "ការណ៍ ក្រសួង"
+    # e.g. "ការណ៍ HSAISESMSMS AULHAIM ក្រសួង" → "ការណ៍ ក្រសួង"
+    result = re.sub(r'\b[A-Z]{3,}(?:\s+[A-Z]{2,})+\b', '', result)
+
+    # Remove long lowercase Latin garbage runs inside valid Khmer lines
+    # e.g. "snstmnaimado sunt ynesinge ភ្នំពេញ" → "ភ្នំពេញ"
+    result = re.sub(r'\b[a-z]{4,}(?:\s+[a-z]{3,}){2,}\b', '', result)
+
+    # Remove inline bracket noise with only Latin/digits inside
+    result = re.sub(r'\[[A-Za-z0-9\s\.\-]{4,}\]', '', result)
+
+    # Remove isolated English garbage tokens commonly seen in Khmer government PDFs
+    # (logos, stamps, page decorations misread as text)
+    for token in [r'SOHAP', r'\(HOWE\)', r'\bWw\b', r'\bchara\b',
+                  r'\bSuny\b', r'\bBI\b', r'\bAS\b',
+                  r'\bShahn\b', r'\bgrag\b', r'\bgiant\b', r'\bBrim\b',
+                  r'\bberi\b', r'\beae\b', r'\bNeha\b']:
+        result = re.sub(r'\s*' + token + r'\s*', ' ', result)
+
+    # Remove isolated English words (4–9 chars) sandwiched between Khmer characters
+    # e.g. "សីលធម៌ Shahn វិជ្ជាជីវៈ" → "សីលធម៌ វិជ្ជាជីវៈ"
+    # Safe: only fires when Khmer is on both sides
+    result = re.sub(
+        r'(?<=[\u1780-\u17FF])\s+(?!(?:Designer|Media|Centre|Excellence|ChatGPT|Gemini|AI|EdTech|JOTA|STEM|KAPE|ASEAN|UNESCO|UNICEF))[A-Z][a-z]{3,8}\s+(?=[\u1780-\u17FF])',
+        ' ', result
+    )
+
+    # Strip leading short Latin/digit noise before Khmer content on same line
+    # e.g. "EM. ការ..." → "ការ...",  "7 a  ជាតិ" → "ជាតិ"
+    result = re.sub(r'^[A-Za-z0-9]{1,4}[\.\s]*(?=[\u1780-\u17FF])', '', result, flags=re.MULTILINE)
+    # Long multi-word: "AMV AAAs AHA wits និងកីឡា" → "និងកីឡា"
+    result = re.sub(r'^(?:[A-Za-z][A-Za-z0-9]*\s+){2,}(?=[\u1780-\u17FF])', '', result, flags=re.MULTILINE)
+    # Catch patterns like "7 a  ជាតិ" — digit + whitespace + short latin + whitespace before Khmer
+    result = re.sub(r'^\d{1,2}\s+[A-Za-z]{1,3}\s+(?=[\u1780-\u17FF])', '', result, flags=re.MULTILINE)
+    # Also handle bare digit(s) + whitespace before Khmer
+    result = re.sub(r'^\d{1,2}\s+(?=[\u1780-\u17FF])', '', result, flags=re.MULTILINE)
+    # Strip single stray Khmer char + dot pattern at line start (e.g. "យ .  ព" → "ព")
+    result = re.sub(r'^[\u1780-\u17FF]\s+\.\s+(?=[\u1780-\u17FF])', '', result, flags=re.MULTILINE)
+    # Strip leading Khmer vowel that can't start a word (OCR split line artifact)
+    result = re.sub(r'^[ាិីឹឺុូួើឿៀែៃោៅ]\s*', '', result, flags=re.MULTILINE)
+
+    # Remove /_ artifact and stray parenthesised all-caps noise
+    result = re.sub(r'/_\s*', '', result)
+    result = re.sub(r'\([A-Z]{2,6}\)', '', result)   # e.g. (HOWE), (OSD), etc.
+    result = re.sub(r'\(\s*\)', '', result)           # Empty parens after token removal
     
     # ---- STEP 2: Khmer character corrections ----
     corrections = [
@@ -337,6 +511,11 @@ def postprocess_khmer(text):
         
         # Common missing vowels
         ('ក្នង', 'ក្នុង'),           # Missing ុ
+        ('ចពោះ', 'ចំពោះ'),           # Missing ំ vowel
+        ('ក្ដុង', 'ក្នុង'),           # ក្ដ misread as ក្ន
+        ('ខ្ញំ', 'ខ្ញុំ'),              # Missing ុ in I/me
+        ('ការរំពួក', 'ការរំឭក'),       # Misread word
+        ('រំពួក', 'រំឭក'),             # Misread variant
         ('ព្រមទាង', 'ព្រមទាំង'),     # Missing ំ
         ('ដំណេរ', 'ដំណើរ'),         # Missing ើ
         ('ស័ក្សា', 'សិក្សា'),         # Vowel confusion
@@ -386,6 +565,71 @@ def postprocess_khmer(text):
         
         # Section header fixes
         ('៖ស', 'សេ'),               # ៖ If prefix on សេចក្តី
+
+        # Khmer numeral misread as Latin letter in numbered lists
+        ('G-Copy', '៤-Copy'),
+        ('C-Copy', '៥-Copy'),
+        ('G-copy', '៤-Copy'),
+        ('C-copy', '៥-Copy'),
+
+        # Scholarship form corrections
+        ('សូមេគារពជូន', 'សូមគោរពជូន'),          # Greeting phrase
+        ('ពាក្យេស្លីសុំ', 'ពាក្យសុំ'),           # Form title
+        ('ក្សត្រត្រ', 'ក្សត្រ'),                  # Extra ត្រ at end of royal title
+        ('ម្រិតវំប្បធម៌', 'វប្បធម៌'),            # Education level
+        ('ជ្នៅ', 'នៅ'),                           # Location preposition
+        ('ឃំ-', 'ឃុំ-'),                          # Village (commune)
+        ('ស្រកា"', 'ស្រុក/'),                     # District
+        ('ខណ្ឌ', 'ខណ្ឌ'),                         # Already correct
+        ('ខេត្ត"', 'ខេត្ត/'),                     # Province
+        ('ក្រុង់', 'ក្រុង'),                      # City: stray ់
+
+        # Official document header corrections (seen in government PDFs)
+        ('ព្រះរាជាណាចក្រកម្មជា', 'ព្រះរាជាណាចក្រកម្ពុជា'),  # Cambodia: ម្ម → ម្ព
+        ('ពាះរាជាណាបក្រ', 'ព្រះរាជាណាចក្រ'),  # Full header phrase fix
+        ('ពាះរាជាណា', 'ព្រះរាជាណា'),           # Partial: ពាះ → ព្រះ
+        ('ណាបក្រ', 'ណាចក្រ'),                  # ចក្រ misread as បក្រ
+        ('ម្ព្ហ', 'ម្ពុ'),                      # in កម្ពុជា
+        ('ប្រូក្សា', 'ប្រឹក្សា'),              # Council: ប្រូ → ប្រឹ
+        ('ក្លិបសកម្ម', 'ក្លឹបសកម្ម'),          # Club: ក្លិ → ក្លឹ
+        ('មជ្លមណ្ឌល', 'មជ្ឈមណ្ឌល'),           # Center: មជ្ល → មជ្ឈ
+        ('ពង្រិក', 'ពង្រីក'),                  # Expand: missing ី vowel
+        ('ការ័', 'ការ'),                       # Extra diacritic artifact
+
+        # ---- Vowel missing / wrong diacritic (very common OCR errors) ----
+        ('ព្រាះរាជ', 'ព្រះរាជ'),               # ព្រះ with extra ា vowel
+        ('ព្រារាជ',  'ព្រះរាជ'),               # variant
+        ('ផ្លវ',    'ផ្លូវ'),                   # road: missing ូ
+        ('ចក្ខវ',   'ចក្ខុវ'),                  # vision: missing ុ (ចក្ខុវិស័យ)
+        ('ចក្ខិ',   'ចក្ខុ'),                   # vowel variant
+        ('ខ្ញំ',    'ខ្ញុំ'),                   # I/me: missing ុ
+        ('យុវជំន',  'យុវជន'),                  # youth: extra ំ
+        ('បច្ខុ',   'បច្ចុ'),                   # present: ខ → ច (បច្ចុប្បន្ន)
+        ('ដណាក់',  'ដំណាក់'),                  # stage: missing ំ
+        ('ឥរិយាបថ័','ឥរិយាបថ'),                # behavior: stray ័
+
+        # ---- Wrong consonant / wrong character ----
+        ('ពិបារណា', 'ពិចារណា'),               # consider: ប → ច
+        ('សម្រួច',  'សម្រេច'),                # achieve/accomplish: ួ → េ
+        ('បណ្តះ',   'បណ្តុះ'),                # cultivate: missing ុ
+        ('ជំនាញ្ញ', 'ជំនាញ'),                 # skill: extra ្ញ
+
+        # Education / government document specific
+        ('ត្រសួង', 'ក្រសួង'),                  # ក្រ misread as ត្រ at line start
+        ('ម៉ូដែល', 'ម៉ូដែល'),                  # Already correct, keep
+        ('ឌីជីប៉ល', 'ឌីជីថល'),               # Digital: ប៉ → ថ
+        ('ឌីជីវល', 'ឌីជីថល'),                # Digital variant
+        ('សតវត្សរ៍', 'សតវត្សរ៍'),             # Already correct
+        ('បំណេះ', 'បំណិន'),                    # Skill: េះ → ិន
+        ('សហគ្រិន', 'សហគ្រិន'),               # Entrepreneurship (correct)
+        ('ពិព័រណ', 'ពិព័រណ៍'),                # Exhibition: missing ៍
+        ('ពិព័រណ៏', 'ពិព័រណ៍'),               # Exhibition: wrong diacritic
+        ('ចរិយាធម', 'ចរិយាធម៌'),              # Morality: missing ៌
+        ('សីលធម', 'សីលធម៌'),                  # Ethics: missing ៌
+        ('ព្រះមហាក្ស', 'ព្រះមហាក្សត្រ'),       # King title truncated
+        ('ជំនា\nន់', 'ជំនាន់'),               # Page-break artifact in keyword
+        ('ជំនានំ', 'ជំនាន់'),                  # Wrong diacritic
+        ('ម៉ូ\nដែល', 'ម៉ូដែល'),               # Page-break artifact
     ]
     
     for pattern, replacement in corrections:
@@ -401,41 +645,43 @@ def postprocess_khmer(text):
     result = re.sub(r'\s{3,}', '  ', result)     # Compress excessive whitespace
     result = re.sub(r'^\]\s*$', '', result, flags=re.MULTILINE)  # Stray brackets
     
-    # ---- STEP 4: Fix broken words (space in middle) ----
-    result = re.sub(r'បា\s+ន', 'បាន', result)    # ដែលបា ន → ដែលបាន
-    result = re.sub(r'រួ\s+ម', 'រួម', result)      # រួ ម → រួម
-    
+    # ---- STEP 4: Fix Khmer period and punctuation misreads ----
+    # Latin "4" at line end after Khmer text = Khmer period ។
+    # (Tesseract cannot distinguish ។ from 4 in many fonts)
+    result = re.sub(r'(?<=[\u1780-\u17FF\s]) 4\s*$', '។', result, flags=re.MULTILINE)
+    result = re.sub(r'(?<=[\u1780-\u17FF])4\s*$',    '។', result, flags=re.MULTILINE)
+
+    # "!" at line end after Khmer = ។
+    result = re.sub(r'(?<=[\u1780-\u17FF])\s*!\s*$', '។', result, flags=re.MULTILINE)
+
+    # Remove trailing "  ." or " ." at end of any line (border/ruler artifact)
+    # Khmer documents use ។ not "." so a trailing space+dot is always noise
+    result = re.sub(r'\s+\.\s*$', '', result, flags=re.MULTILINE)
+
+    # "4" mid-sentence sandwiched between Khmer = ។ (e.g. "...ជន 4 ការ...")
+    result = re.sub(r'(?<=[\u1780-\u17FF]) 4 (?=[\u1780-\u17FF])', '។ ', result)
+
+    # ---- STEP 4.5: Common numeral OCR confusions ----
+    # ២១ (21) is misread as "wo" — seen in "សតវត្សរ៍ទី wo" (21st century)
+    result = re.sub(r'(?<=ទី\s)wo\b', '២១', result)
+    result = re.sub(r'\bwo\b(?=\s*[\u1780-\u17FF])', '២១', result)
+
+    # "7" before Khmer digits = often misread Khmer numeral (remove stray 7)
+    result = re.sub(r'\b7(?=[\u17E0-\u17E9])', '', result)
+
+    # ---- STEP 5: Fix broken words (space in middle) ----
+    result = re.sub(r'បា\s+ន', 'បាន', result)
+    result = re.sub(r'រួ\s+ម', 'រួម', result)
+
     # Remove empty lines left by cleanup (keep max 2 consecutive)
     result = re.sub(r'\n{4,}', '\n\n\n', result)
     
     return result
 
 
-# ============================================================
-# FULL PDF READER: Replaces your read_pdf_file function
-# ============================================================
-def read_pdf_improved(filename, dpi=300, preset="auto", apply_postprocess=True, verbose=True):
-    """
-    Improved PDF text extraction with smart preprocessing.
-    
-    Drop-in replacement for read_pdf_file() in your notebook.
-    
-    Args:
-        filename: Path to PDF file
-        dpi: Resolution for PDF→image conversion (300 recommended)
-        preset: 'auto', 'clean', 'scan', or 'photo'
-        apply_postprocess: Whether to run Khmer text corrections
-        verbose: Print progress
-    
-    Returns:
-        str: Extracted text from all pages
-    """
-    import pytesseract
-    from pdf2image import convert_from_path
-    import os
-    
-    # Set Tesseract path
-    # Set Tesseract path
+def run_ocr(processed_pil_image):
+    """Run Tesseract OCR on a preprocessed PIL image. Returns raw text."""
+    import pytesseract, os
     try:
         homebrew_path = '/opt/homebrew/bin/tesseract'
         if os.path.exists(homebrew_path):
@@ -444,66 +690,92 @@ def read_pdf_improved(filename, dpi=300, preset="auto", apply_postprocess=True, 
             conda_prefix = os.environ.get('CONDA_PREFIX')
             if conda_prefix:
                 pytesseract.pytesseract.tesseract_cmd = f"{conda_prefix}/bin/tesseract"
-    except:
+    except Exception:
         pass
-    
+    config = '--oem 1 --psm 4 -c preserve_interword_spaces=1 -c textord_min_linesize=1.5'
+    return pytesseract.image_to_string(processed_pil_image, lang='khm+eng', config=config)
+
+
+# ============================================================
+# FULL PDF READER: Replaces your read_pdf_file function
+# ============================================================
+def read_pdf_improved(filename, dpi=300, preset="auto", apply_postprocess=True, verbose=True):
+    """Run the full OCR pipeline on a PDF file. Returns extracted text."""
+    from pdf2image import convert_from_path
+
     if verbose:
         print(f"📄 Loading: {filename}")
-    
+
     images = convert_from_path(filename, dpi=dpi)
-    
+
     if verbose:
         print(f"   Found {len(images)} pages")
-    
-    config = '--oem 3 --psm 1 -c preserve_interword_spaces=1'
+
     extracted_text = ""
-    
     for i, img in enumerate(images):
         if verbose:
             print(f"\n📸 Processing Page {i+1}/{len(images)}...")
-        
-        # Smart preprocessing
         processed = preprocess_for_ocr(img, preset=preset, verbose=verbose)
-        
-        # OCR
-        text = pytesseract.image_to_string(processed, lang='khm+eng', config=config)
-        
-        # Post-processing corrections
+        text = run_ocr(processed)
         if apply_postprocess:
             text = postprocess_khmer(text)
-        
         extracted_text += f"--- Page {i+1} ---\n{text}\n"
-    
+
     if verbose:
         print(f"\n✅ Extraction complete!")
-    
     return extracted_text
 
 
 # ============================================================
-# LEGACY: Old preprocessing (kept for comparison)
+# PHASE 3: AI TEXT CORRECTION (Gemini or Claude)
+# Switch provider by setting AI_PROVIDER=claude or AI_PROVIDER=gemini in .env
 # ============================================================
-def preprocess_old(pil_image):
-    """Original preprocessing: upscale + adaptive threshold."""
-    img = np.array(pil_image)
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = img
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 31, 2)
-    return Image.fromarray(binary)
+def _correct_with_gemini(text, key, prompt):
+    from google import genai
+    import time
+    client = genai.Client(api_key=key)
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            return response.text
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "exceeded your current quota" in error_str:
+                if attempt < 2:
+                    wait_time = 4 * (attempt + 1)
+                    print(f"⏳ Gemini Quota hit. Waiting {wait_time}s before retry ({attempt+1}/3)...")
+                    time.sleep(wait_time)
+                    continue
+            print(f"⚠️ Gemini correction failed: {e}")
+            return text
+    return text
 
 
-def get_best_tesseract_config():
-    """Returns recommended Tesseract config for Khmer documents."""
-    return '--oem 3 --psm 3 -c preserve_interword_spaces=1'
+def _correct_with_claude(text, key, prompt):
+    import anthropic, time
+    client = anthropic.Anthropic(api_key=key)
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model='claude-haiku-4-5',
+                max_tokens=8096,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+            return response.content[0].text
+        except anthropic.RateLimitError:
+            if attempt < 2:
+                wait_time = 4 * (attempt + 1)
+                print(f"⏳ Claude rate limit. Waiting {wait_time}s before retry ({attempt+1}/3)...")
+                time.sleep(wait_time)
+                continue
+            print("⚠️ Claude correction failed: rate limit exceeded.")
+            return text
+        except Exception as e:
+            print(f"⚠️ Claude correction failed: {e}")
+            return text
+    return text
 
 
-# ============================================================
-# PHASE 3: AI TEXT CORRECTION (Google Gemini)
-# ============================================================
 def correct_with_ai(text, api_key=None, model="gemini-2.0-flash"):
     """
     Use Google Gemini AI to fix OCR errors in Khmer text.
@@ -520,9 +792,8 @@ def correct_with_ai(text, api_key=None, model="gemini-2.0-flash"):
         str: Corrected text
     """
     import os
-    from google import genai
-    
-    # Load API key from .env file (no extra dependency needed)
+
+    # Load .env file
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -531,18 +802,11 @@ def correct_with_ai(text, api_key=None, model="gemini-2.0-flash"):
                 if line and not line.startswith('#') and '=' in line:
                     k, v = line.split('=', 1)
                     os.environ.setdefault(k.strip(), v.strip().strip("'\""))
-    
-    key = api_key or os.environ.get('GOOGLE_API_KEY')
-    if not key:
-        print("❌ No API key! Set GOOGLE_API_KEY environment variable or pass api_key parameter.")
-        print("   Example: export GOOGLE_API_KEY='your-key-here'")
-        return text
-    
-    # Create client
-    client = genai.Client(api_key=key)
-    
-    prompt = f"""You are a Khmer OCR error correction expert. 
-The following text was extracted from a PDF using Tesseract OCR. 
+
+    provider = os.environ.get('AI_PROVIDER', 'gemini').lower()
+
+    prompt = f"""You are a Khmer OCR error correction expert.
+The following text was extracted from a PDF using Tesseract OCR.
 It contains errors specific to Khmer script OCR.
 
 RULES:
@@ -556,17 +820,19 @@ RULES:
 
 TEXT TO CORRECT:
 {text}"""
-    
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt
-        )
-        return response.text
-    except Exception as e:
-        print(f"⚠️ AI correction failed: {e}")
-        print("   Returning text with only post-processing corrections.")
-        return text
+
+    if provider == 'claude':
+        key = api_key or os.environ.get('ANTHROPIC_API_KEY')
+        if not key:
+            print("❌ Set ANTHROPIC_API_KEY in .env to use Claude.")
+            return text
+        return _correct_with_claude(text, key, prompt)
+    else:
+        key = api_key or os.environ.get('GOOGLE_API_KEY')
+        if not key:
+            print("❌ Set GOOGLE_API_KEY in .env to use Gemini.")
+            return text
+        return _correct_with_gemini(text, key, prompt)
 
 
 def read_pdf_with_ai(filename, api_key=None, dpi=300, preset="auto", verbose=True):
@@ -601,3 +867,5 @@ def read_pdf_with_ai(filename, api_key=None, dpi=300, preset="auto", verbose=Tru
         print("✅ AI correction complete!")
     
     return corrected
+
+

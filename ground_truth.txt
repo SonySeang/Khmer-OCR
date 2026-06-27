@@ -1,2 +1,0 @@
-This is a sample abstract from a document to test OCR.
-It contains multiple lines and some typical words.
